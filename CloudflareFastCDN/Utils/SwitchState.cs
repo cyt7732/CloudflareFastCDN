@@ -16,6 +16,7 @@ namespace CloudflareFastCDN.Utils
 
         public string CurrentIp { get; set; } = string.Empty;
         public double CurrentScore { get; set; }
+        public double CurrentDelayMs { get; set; }
         public string LastSwitchAt { get; set; } = string.Empty;
         public int ConsecutiveFailures { get; set; }
 
@@ -91,10 +92,11 @@ namespace CloudflareFastCDN.Utils
             return (true, $"显著更优（当前 {CurrentScore:0.00} → 候选 {candidateScore:0.00}）");
         }
 
-        public void MarkSwitched(string ip, double score)
+        public void MarkSwitched(string ip, double score, double delayMs = 0)
         {
             CurrentIp = ip;
             CurrentScore = score;
+            CurrentDelayMs = delayMs;
             LastSwitchAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             ConsecutiveFailures = 0;
             Save();
@@ -104,10 +106,11 @@ namespace CloudflareFastCDN.Utils
         /// 初始化基准（首次运行或状态文件丢失时，从当前 DNS 记录反推）。
         /// 不设置冷却期，避免刚启动就误判。
         /// </summary>
-        public void Initialize(string ip, double score)
+        public void Initialize(string ip, double score, double delayMs = 0)
         {
             CurrentIp = ip;
             CurrentScore = score;
+            CurrentDelayMs = delayMs;
             LastSwitchAt = string.Empty;
             ConsecutiveFailures = 0;
             Save();

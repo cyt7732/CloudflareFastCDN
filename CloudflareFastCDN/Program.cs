@@ -505,7 +505,7 @@ namespace CloudflareFastCDN
         /// <summary>
         /// 从 DNS 服务商 API 读取当前 A 记录，测出它的评分，用于初始化切换基准。
         /// </summary>
-        private static async Task<(string Ip, double Score)?> ProbeCurrentDnsIps(IReadOnlyList<DnsUpdateProvider> providers)
+        private static async Task<(string Ip, double Score, double DelayMs)?> ProbeCurrentDnsIps(IReadOnlyList<DnsUpdateProvider> providers)
         {
             var httpPing = new Httping();
             foreach (var provider in providers)
@@ -545,7 +545,7 @@ namespace CloudflareFastCDN
                         }
                         var lossRate = 1d - (double)probe.success / HttpProbeCount;
                         var score = avg.TotalMilliseconds * (1 + cv) * (1 + lossRate);
-                        return (ip.ToString(), score);
+                        return (ip.ToString(), score, avg.TotalMilliseconds);
                     }
                 }
             }
@@ -609,7 +609,7 @@ namespace CloudflareFastCDN
             }
 
             var switchState = SwitchState.Load();
-            switchState.MarkSwitched(best.IP.ToString(), 0);
+            switchState.MarkSwitched(best.IP.ToString(), 0, best.Delay.TotalMilliseconds);
             switchState.Save();
 
             var assignedIps = assignedIpsByRank
@@ -706,8 +706,8 @@ namespace CloudflareFastCDN
                 var baseline = await ProbeCurrentDnsIps(dnsUpdateProviders);
                 if (baseline.HasValue)
                 {
-                    switchState.Initialize(baseline.Value.Ip, baseline.Value.Score);
-                    Console.WriteLine($"切换基准初始化：{baseline.Value.Ip} 评分 {baseline.Value.Score:0.00}（从当前 DNS 记录反推）");
+                    switchState.Initialize(baseline.Value.Ip, baseline.Value.Score, baseline.Value.DelayMs);
+                    Console.WriteLine($"切换基准初始化：{baseline.Value.Ip} 评分 {baseline.Value.Score:0.00}（延迟 {baseline.Value.DelayMs:0.00}ms，从当前 DNS 记录反推）");
                 }
                 else
                 {
@@ -854,6 +854,12 @@ namespace CloudflareFastCDN
             if (!shouldSwitch)
             {
                 Console.WriteLine("保持当前 IP 不变");
+                // 返回当前 IP，避免外层误判「无可用IP」而立即重跑
+                if (IPAddress.TryParse(switchState.CurrentIp, out var keepIp))
+                {
+                    var keep = new AssignedIp(keepIp, TimeSpan.FromMilliseconds(switchState.CurrentDelayMs), 1);
+                    return new SelectionResult(new[] { keep });
+                }
                 return SelectionResult.Empty;
             }
 
@@ -892,7 +898,7 @@ namespace CloudflareFastCDN
 
             if (assignedIpsByRank.Count > 0)
             {
-                switchState.MarkSwitched(top.Ip.ToString(), top.Score);
+                switchState.MarkSwitched(top.Ip.ToString(), top.Score, top.Delay.TotalMilliseconds);
             }
 
             var assignedIps = assignedIpsByRank
@@ -907,6 +913,13 @@ namespace CloudflareFastCDN
             else
             {
                 Console.WriteLine("本轮没有记录到成功分配的IP");
+            }
+
+            if (assignedIps.Count == 0 && IPAddress.TryParse(switchState.CurrentIp, out var fallbackIp))
+            {
+                Console.WriteLine("DNS 更新未成功，保持当前记录");
+                var fallback = new AssignedIp(fallbackIp, TimeSpan.FromMilliseconds(switchState.CurrentDelayMs), 1);
+                return new SelectionResult(new[] { fallback });
             }
 
             return new SelectionResult(assignedIps);
