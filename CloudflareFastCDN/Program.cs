@@ -26,6 +26,8 @@ namespace CloudflareFastCDN
         private static readonly TimeSpan FinalCandidateMaxInterval = TimeSpan.FromSeconds(45);
         private const int SubnetProbePingCount = 2;
         private const int SubnetSampleCount = 6;
+        private const int NewCandidateCount = 10;   // 每轮从 TCP 快筛里取多少个新 IP
+        private const int SeedPoolCapacity = 10;    // 种子库容量
         private static readonly TimeSpan SupplementalHttpCheckInterval = TimeSpan.FromMinutes(5);
         private const int SupplementalHttpCheckCount = 3;
 
@@ -564,12 +566,12 @@ namespace CloudflareFastCDN
         private static async Task<SelectionResult> RunFullSelection(IReadOnlyList<DnsUpdateProvider> dnsUpdateProviders)
         {
             var processor = new IPProcessor();
-
-            var subnetCache = new SubnetCache();
-            subnetCache.Load();
-
             var seedPool = new SeedPool();
             seedPool.Load();
+            var subnetTable = new SubnetScoreTable();
+            subnetTable.Load();
+            var switchState = SwitchState.Load();
+
             var seedIps = seedPool.GetIPs();
             if (seedIps.Count > 0)
             {
@@ -577,430 +579,178 @@ namespace CloudflareFastCDN
             }
             DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
 
-            var ipAddresses = processor.LoadIPRanges();
-            var sampleCount = Math.Max(0, AppConfig.MaxIps - seedIps.Count);
-            ipAddresses = SampleData(ipAddresses, sampleCount);
+            // 1. 抽样：70% 网段加权 + 30% 全量随机
+            var allIps = processor.LoadIPRanges();
+            var weightedCount = (int)Math.Round(AppConfig.MaxIps * 0.7);
+            var randomCount = Math.Max(0, AppConfig.MaxIps - weightedCount);
+            var rng = new Random();
+            var weightedIps = subnetTable.SampleWeighted(weightedCount, rng);
+            var randomIps = SampleData(allIps, randomCount);
+            var sampledIps = weightedIps.Concat(randomIps).Distinct().ToList();
 
-            // 合并种子 IP（去重后追加）
-            if (seedIps.Count > 0)
-            {
-                var seedSet = new HashSet<IPAddress>(seedIps);
-                var merged = new List<IPAddress>(seedIps);
-                foreach (var ip in ipAddresses)
-                {
-                    if (!seedSet.Contains(ip))
-                        merged.Add(ip);
-                }
-                Console.WriteLine($"本轮候选：{merged.Count} 个（种子 {seedIps.Count} + 抽样 {ipAddresses.Count}）");
-                ipAddresses = merged;
-            }
+            Console.WriteLine($"抽样：{sampledIps.Count} 个（网段加权 {weightedIps.Count} + 全量随机 {randomIps.Count}）");
+            DashboardState.UpdateRun(run => run.Sampled = sampledIps.Count, $"TCP 快筛（{sampledIps.Count}个IP）");
 
-            TcpPing task = new TcpPing(ipAddresses, FirstRoundPingCount);
-            Console.WriteLine($"开始第1轮检查：TCP Ping 全量{FirstRoundPingCount}次");
-            DashboardState.UpdateRun(run => run.Sampled = ipAddresses.Count, $"第1轮TCP Ping（{ipAddresses.Count}个IP）");
-            var firstRoundResults = await task.RunAsync();
-            var topPings = firstRoundResults.Where(item => item.Sended == FirstRoundPingCount && item.Received >= FirstRoundPingCount - 1).ToList();
-            var secondRoundCandidateLimit = CalculateSecondRoundCandidateCount(ipAddresses.Count);
-            var secondRoundPings = topPings.Take(secondRoundCandidateLimit).ToList();
-
-            Console.WriteLine($"开始第2轮检查：第1轮前{secondRoundPings.Count}名（抽样{ipAddresses.Count}个，前{SecondRoundCandidateRatio:P0}上限{secondRoundCandidateLimit}个），{SecondRoundPingCount}次Ping，允许最多丢包{SecondRoundMaxPacketLoss}/{SecondRoundPingCount}");
-            DashboardState.UpdateRun(run => run.FirstRoundPassed = topPings.Count, $"第2轮ICMP Ping（{secondRoundPings.Count}个IP）");
-            TcpPing secondRoundPingTask = new TcpPing(secondRoundPings.Select(item => item.IP).ToList(), SecondRoundPingCount);
-            var secondRoundResults = await secondRoundPingTask.RunAsync();
-            var secondRoundPassed = secondRoundResults
-                .Where(item => item.Sended == SecondRoundPingCount && item.Sended - item.Received <= SecondRoundMaxPacketLoss)
-                .ToList();
-            DashboardState.UpdateRun(run => run.SecondRoundPassed = secondRoundPassed.Count);
-
-            var httpCandidates = secondRoundPassed.Take(FinalSecondRoundCandidateCount).ToList();
-            var remainingSecondRoundCandidates = secondRoundPassed
-                .Skip(FinalSecondRoundCandidateCount)
+            // 2. TCP 快筛
+            var tcpPing = new TcpPing(sampledIps, FirstRoundPingCount);
+            var tcpResults = await tcpPing.RunAsync();
+            var tcpPassed = tcpResults
+                .Where(item => item.Sended == FirstRoundPingCount && item.Received >= FirstRoundPingCount - 1)
                 .ToList();
 
-            var cachedCandidateIps = new HashSet<IPAddress>();
-            var sampledSubnets = subnetCache.RandomSampleIPs(SubnetSampleCount);
-            if (sampledSubnets.Any())
+            Console.WriteLine($"TCP 快筛：{tcpPassed.Count}/{sampledIps.Count} 通过");
+            DashboardState.UpdateRun(run => run.FirstRoundPassed = tcpPassed.Count);
+
+            if (tcpPassed.Count == 0)
             {
-                Console.WriteLine($"开始子网缓存阶段：从{subnetCache.SubnetCount}个缓存/24子网中随机取出{sampledSubnets.Count}个IP进行TCP Ping验证");
-                DashboardState.UpdateRun(run => run.CachedSampled = sampledSubnets.Count, $"子网缓存TCP Ping（{sampledSubnets.Count}个IP）");
-                TcpPing subnetTcpPing = new TcpPing(sampledSubnets.Select(item => item.IP).ToList(), SubnetProbePingCount);
-                var subnetResults = await subnetTcpPing.RunAsync();
-                var subnetPassed = subnetResults
-                    .Where(result => result.Received > 0)
-                    .OrderBy(result => result.Delay.TotalMilliseconds * (1 + (double)(result.Sended - result.Received) / Math.Max(1, result.Sended)))
-                    .ToList();
-                Console.WriteLine($"子网缓存阶段：{subnetPassed.Count}/{sampledSubnets.Count}个IP通过TCP Ping，加入最终候选");
-                DashboardState.UpdateRun(run => run.CachedPassed = subnetPassed.Count);
-                cachedCandidateIps.UnionWith(subnetPassed.Select(result => result.IP));
-
-                bool evicted = subnetCache.RecordTcpPingOutcomes(sampledSubnets, subnetPassed.Select(result => result.IP));
-                if (evicted || subnetPassed.Count < sampledSubnets.Count)
-                    subnetCache.Save();
-
-                foreach (var passedIp in subnetPassed.Take(FinalCachedCandidateCount))
-                {
-                    if (!httpCandidates.Any(candidate => candidate.IP.Equals(passedIp.IP)))
-                        httpCandidates.Add(passedIp);
-                }
-            }
-
-            foreach (var secondRoundIp in remainingSecondRoundCandidates)
-            {
-                if (httpCandidates.Count >= FinalHttpCandidateCount)
-                    break;
-
-                if (!httpCandidates.Any(candidate => candidate.IP.Equals(secondRoundIp.IP)))
-                    httpCandidates.Add(secondRoundIp);
-            }
-
-            if (httpCandidates.Count > FinalHttpCandidateCount)
-            {
-                Console.WriteLine($"最终检查候选超过{FinalHttpCandidateCount}个，仅保留前{FinalHttpCandidateCount}个IP");
-                httpCandidates = httpCandidates.Take(FinalHttpCandidateCount).ToList();
-            }
-
-            if (!httpCandidates.Any())
-            {
-                Console.WriteLine("没有IP进入HTTP验证阶段");
+                Console.WriteLine("没有 IP 通过 TCP 快筛，跳过本轮");
                 return SelectionResult.Empty;
             }
 
-            Console.WriteLine($"开始最终检查：{httpCandidates.Count}个候选IP进行HTTP验证，每个IP检测{HttpProbeCount}次，单次间隔{FinalProbeMinInterval.TotalSeconds:0}-{FinalProbeMaxInterval.TotalSeconds:0}秒，至少成功{HttpMinSuccessCount}次，当前模式：{(AppConfig.BandwidthPriority ? "带宽优先" : "延迟优先")}");
-            DashboardState.UpdateRun(run => run.HttpCandidates = httpCandidates.Count);
-            int count = 0;
-            List<PingData> topHttpList = new List<PingData>();
-            var stabilityScores = new Dictionary<IPAddress, double>();
+            // 3. 新候选 = TCP 延迟最低的 N 个
+            var newCandidates = tcpPassed.Take(NewCandidateCount).Select(item => item.IP).ToList();
+            Console.WriteLine($"新候选：{newCandidates.Count} 个（TCP 延迟最低）");
+
+            // 4. 候选 = 种子 + 新
+            var candidates = seedIps.Concat(newCandidates).Distinct().ToList();
+            Console.WriteLine($"本轮候选：{candidates.Count} 个（种子 {seedIps.Count} + 新 {newCandidates.Count}）");
+
+            DashboardState.UpdateRun(run => run.HttpCandidates = candidates.Count, $"HTTP 验证（{candidates.Count}个IP）");
+
+            // 5. 全部做 HTTP 验证
             var httpPing = new Httping();
-            foreach (var ip in httpCandidates)
+            var scored = new List<(IPAddress Ip, double Score, TimeSpan Delay)>();
+            var seedSet = new HashSet<IPAddress>(seedIps);
+            int index = 0;
+            foreach (var ip in candidates)
             {
-                count++;
-                DashboardState.SetSelectionDetail($"HTTP验证 {count}/{httpCandidates.Count} {ip.IP}");
-                var pingDelay = ip.Delay;
-                var pingResult = await httpPing.PingWithOutcome(ip.IP, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
-                var averageDelay = pingResult.success > 0
-                    ? TimeSpan.FromMilliseconds(pingResult.totalDelay.TotalMilliseconds / pingResult.success)
+                index++;
+                DashboardState.SetSelectionDetail($"HTTP验证 {index}/{candidates.Count} {ip}");
+                var probe = await httpPing.PingWithOutcome(ip, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
+                var avg = probe.success > 0
+                    ? TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success)
                     : TimeSpan.Zero;
 
-                var errorMessage = pingResult.success >= HttpProbeCount ? string.Empty : $" 失败原因：{FormatError(pingResult.error)}";
-                var skipMessage = pingResult.skipNode ? "，已跳过此节点" : string.Empty;
-                Console.WriteLine($"最终结果 [{count}] {ip.IP} HTTP成功：{pingResult.success}/{HttpProbeCount} HTTP均延时：{averageDelay.TotalMilliseconds}ms{errorMessage}{skipMessage}");
-                var candidatePassed = !pingResult.skipNode && pingResult.success >= HttpMinSuccessCount;
-                if (candidatePassed)
+                var passed = !probe.skipNode && probe.success >= HttpMinSuccessCount;
+                if (passed)
                 {
-                    ip.Delay = averageDelay;
-                    // 稳定性评分：平均延迟 × (1 + 变异系数) × (1 + 丢包率)
                     var cv = 0d;
-                    if (pingResult.delays.Count > 1 && averageDelay.TotalMilliseconds > 0)
+                    if (probe.delays.Count > 1 && avg.TotalMilliseconds > 0)
                     {
-                        var mean = averageDelay.TotalMilliseconds;
-                        var variance = pingResult.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
+                        var mean = avg.TotalMilliseconds;
+                        var variance = probe.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
                         cv = Math.Sqrt(variance) / mean;
                     }
-                    var lossRate = 1d - (double)pingResult.success / HttpProbeCount;
-                    var score = averageDelay.TotalMilliseconds * (1 + cv) * (1 + lossRate);
-                    stabilityScores[ip.IP] = score;
-                    Console.WriteLine($"  → 稳定性评分 {score:0.00}（变异系数 {cv:0.00}，丢包率 {lossRate:P0}）");
-                    topHttpList.Add(ip);
+                    var lossRate = 1d - (double)probe.success / HttpProbeCount;
+                    var score = avg.TotalMilliseconds * (1 + cv) * (1 + lossRate);
+                    scored.Add((ip, score, avg));
+                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.success}/{HttpProbeCount} 均延时 {avg.TotalMilliseconds:0.00}ms → 评分 {score:0.00}（cv {cv:0.00}，丢包 {lossRate:P0}）");
                 }
-                else if (seedPool.Contains(ip.IP))
+                else
                 {
-                    seedPool.RecordFailure(ip.IP);
+                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.success}/{HttpProbeCount} 未通过：{FormatError(probe.error)}");
                 }
 
                 DashboardState.UpdateRun(run =>
                 {
                     run.Candidates.Add(new CandidateResult
                     {
-                        Ip = ip.IP.ToString(),
-                        Source = cachedCandidateIps.Contains(ip.IP) ? "子网缓存" : "ICMP",
-                        PingMs = pingDelay > TimeSpan.Zero ? Math.Round(pingDelay.TotalMilliseconds, 2) : null,
-                        HttpSuccess = pingResult.success,
+                        Ip = ip.ToString(),
+                        Source = seedSet.Contains(ip) ? "种子" : "新抽",
+                        HttpSuccess = probe.success,
                         HttpTotal = HttpProbeCount,
-                        HttpAvgMs = pingResult.success > 0 ? Math.Round(averageDelay.TotalMilliseconds, 2) : null,
-                        Passed = candidatePassed,
-                        Error = pingResult.success >= HttpProbeCount ? null : FormatError(pingResult.error) + skipMessage
+                        HttpAvgMs = probe.success > 0 ? Math.Round(avg.TotalMilliseconds, 2) : null,
+                        Passed = passed,
+                        Error = passed ? null : FormatError(probe.error)
                     });
-                    run.HttpPassed = topHttpList.Count;
+                    run.HttpPassed = scored.Count;
                 });
 
-                if (count < httpCandidates.Count)
+                if (index < candidates.Count)
                 {
                     var delay = GetRandomDelay(FinalCandidateMinInterval, FinalCandidateMaxInterval);
-                    Console.WriteLine($"等待{delay.TotalSeconds:0}秒后测试下一个HTTP候选节点");
+                    Console.WriteLine($"等待{delay.TotalSeconds:0}秒后测试下一个候选");
                     await Task.Delay(delay);
                 }
             }
 
-            List<PingData> topNData;
-            if (topHttpList.Any())
+            // 6. 排序
+            scored.Sort((a, b) => a.Score.CompareTo(b.Score));
+            if (scored.Count == 0)
             {
-                if (!AppConfig.BandwidthPriority)
-                {
-                    topHttpList.Sort((left, right) =>
-                    {
-                        var leftScore = stabilityScores.TryGetValue(left.IP, out var ls) ? ls : double.MaxValue;
-                        var rightScore = stabilityScores.TryGetValue(right.IP, out var rs) ? rs : double.MaxValue;
-                        return leftScore.CompareTo(rightScore);
-                    });
-                    topNData = topHttpList.Take(3).ToList();
-
-                    if (topNData.Count > 0)
-                    {
-                        Console.WriteLine($"当前为连接速度优先，按稳定性评分选择IP {topNData[0].IP} 评分{stabilityScores.GetValueOrDefault(topNData[0].IP):0.00}（延迟 {topNData[0].Delay.TotalMilliseconds:0.00}ms）");
-                    }
-                }
-                else
-                {
-                    var speedRankedList = new List<(PingData Data, double Mbps, long BytesRead, TimeSpan Duration)>();
-                    for (int speedIndex = 0; speedIndex < topHttpList.Count; speedIndex++)
-                    {
-                        var ip = topHttpList[speedIndex];
-                        DashboardState.SetSelectionDetail($"下载测速 {speedIndex + 1}/{topHttpList.Count} {ip.IP}");
-                        var speedResult = await httpPing.SpeedTest(ip.IP);
-                        if (!speedResult.success)
-                        {
-                            if (speedResult.missing)
-                            {
-                                Console.WriteLine($"测速文件不存在，跳过下载测速 {ip.IP} /speedtest，原因：{FormatError(speedResult.error)}");
-                            }
-                            else
-                            {
-                                Console.WriteLine($"下载测速失败 {ip.IP}，原因：{FormatError(speedResult.error)}");
-                            }
-
-                        }
-                        else
-                        {
-                            speedRankedList.Add((ip, speedResult.mbps, speedResult.bytesRead, speedResult.duration));
-                            var testedIp = ip.IP.ToString();
-                            DashboardState.UpdateRun(run =>
-                            {
-                                var candidate = run.Candidates.FirstOrDefault(item => item.Ip == testedIp);
-                                if (candidate != null)
-                                {
-                                    candidate.Mbps = Math.Round(speedResult.mbps, 2);
-                                }
-                            });
-                            Console.WriteLine($"下载测速 [{speedRankedList.Count}] {ip.IP} 速度：{speedResult.mbps:0.00} Mbps 已下载：{speedResult.bytesRead / 1024d / 1024d:0.00} MB 用时：{speedResult.duration.TotalMilliseconds:0}ms");
-                        }
-
-                        if (speedIndex < topHttpList.Count - 1)
-                        {
-                            var delay = GetRandomDelay(FinalCandidateMinInterval, FinalCandidateMaxInterval);
-                            Console.WriteLine($"等待{delay.TotalSeconds:0}秒后测速下一个候选节点");
-                            await Task.Delay(delay);
-                        }
-                    }
-
-                    if (speedRankedList.Any())
-                    {
-                        speedRankedList.Sort((left, right) =>
-                        {
-                            var speedCompare = right.Mbps.CompareTo(left.Mbps);
-                            return speedCompare != 0 ? speedCompare : left.Data.Delay.CompareTo(right.Data.Delay);
-                        });
-
-                        topNData = speedRankedList.Take(3).Select(result => result.Data).ToList();
-                        Console.WriteLine($"最终按下载带宽选择IP {topNData[0].IP} {speedRankedList[0].Mbps:0.00} Mbps");
-                    }
-                    else
-                    {
-                        topHttpList.Sort((left, right) =>
-                        {
-                            var leftScore = stabilityScores.TryGetValue(left.IP, out var ls) ? ls : double.MaxValue;
-                            var rightScore = stabilityScores.TryGetValue(right.IP, out var rs) ? rs : double.MaxValue;
-                            return leftScore.CompareTo(rightScore);
-                        });
-                        topNData = topHttpList.Take(3).ToList();
-
-                        if (topNData.Count > 0)
-                        {
-                            Console.WriteLine($"下载测速不可用，回退到稳定性评分选择IP {topNData[0].IP} 评分{stabilityScores.GetValueOrDefault(topNData[0].IP):0.00}（延迟 {topNData[0].Delay.TotalMilliseconds:0.00}ms）");
-                        }
-                    }
-                }
-            }
-            else
-            {
-                topNData = new List<PingData>();
+                Console.WriteLine("没有 IP 通过 HTTP 验证，本轮结束");
+                return SelectionResult.Empty;
             }
 
+            var top = scored[0];
+            Console.WriteLine($"本轮最优：{top.Ip} 评分 {top.Score:0.00}（延迟 {top.Delay.TotalMilliseconds:0.00}ms）");
+
+            // 7. 更新种子库（前 N 名）
+            var seedCount = Math.Min(scored.Count, SeedPoolCapacity);
+            for (int i = 0; i < seedCount; i++)
+            {
+                var item = scored[i];
+                seedPool.AddOrUpdate(item.Ip, item.Score, item.Delay.TotalMilliseconds);
+            }
+            seedPool.Save();
+            DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
+            Console.WriteLine($"种子库更新：本轮入库 {seedCount} 个，当前共 {seedPool.Count} 个");
+
+            // 8. 更新网段分数表
+            foreach (var item in scored)
+            {
+                subnetTable.RecordHit(item.Ip, item.Score);
+            }
+            subnetTable.Save();
+            Console.WriteLine($"网段分数表：当前记录 {subnetTable.Count} 个网段");
+
+            // 9. 切换判定
+            var (shouldSwitch, reason) = switchState.Evaluate(top.Ip.ToString(), top.Score);
+            Console.WriteLine($"切换判定：{reason}");
+            if (!shouldSwitch)
+            {
+                Console.WriteLine("保持当前 IP 不变");
+                return SelectionResult.Empty;
+            }
+
+            // 10. 更新 DNS
             var assignedIpsByRank = new Dictionary<int, PingData>();
-
-            if (topNData.Count > 0)
+            foreach (var provider in dnsUpdateProviders)
             {
-                // 与当前正在使用的 IP 对比：现有 IP 更快时保留，避免被更差的候选覆盖
-                var currentIpScores = new Dictionary<IPAddress, (TimeSpan Average, double Score)>();
-                foreach (var provider in dnsUpdateProviders)
+                foreach (var domain in provider.GetDomains(0))
                 {
-                    foreach (var domain in provider.GetDomains(0))
+                    var updated = false;
+                    try
                     {
-                        try
+                        Console.WriteLine($"开始更新[{provider.ProviderName}]域名 {domain} → {top.Ip}");
+                        updated = await provider.Manager.AddOrUpdateARecord(domain, top.Ip.ToString());
+                        if (updated)
                         {
-                            var apiIps = await provider.Manager.GetARecordIps(domain);
-                            List<IPAddress> addresses;
-                            if (apiIps.Count > 0)
-                            {
-                                addresses = apiIps
-                                    .Select(ip => IPAddress.TryParse(ip, out var parsed) ? parsed : null)
-                                    .Where(ip => ip != null && ip.AddressFamily == AddressFamily.InterNetwork)
-                                    .Select(ip => ip!)
-                                    .Distinct()
-                                    .ToList();
-                            }
-                            else
-                            {
-                                var resolved = await Dns.GetHostAddressesAsync(domain);
-                                addresses = resolved
-                                    .Where(item => item.AddressFamily == AddressFamily.InterNetwork)
-                                    .Distinct()
-                                    .ToList();
-                            }
-
-                            foreach (var address in addresses)
-                            {
-                                if (currentIpScores.ContainsKey(address))
-                                {
-                                    continue;
-                                }
-
-                                var probe = await httpPing.PingWithOutcome(address, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
-                                if (probe.success >= HttpMinSuccessCount)
-                                {
-                                    var average = TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success);
-                                    var cv = 0d;
-                                    if (probe.delays.Count > 1 && average.TotalMilliseconds > 0)
-                                    {
-                                        var mean = average.TotalMilliseconds;
-                                        var variance = probe.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
-                                        cv = Math.Sqrt(variance) / mean;
-                                    }
-                                    var lossRate = 1d - (double)probe.success / HttpProbeCount;
-                                    var score = average.TotalMilliseconds * (1 + cv) * (1 + lossRate);
-                                    currentIpScores[address] = (average, score);
-                                    Console.WriteLine($"当前使用中的 IP {address}（{domain}）HTTP延迟 {average.TotalMilliseconds:0.00}ms 评分 {score:0.00}");
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"检测当前 IP 失败 {domain}：{FormatError(ex.Message)}");
+                            assignedIpsByRank.TryAdd(0, new PingData { IP = top.Ip, Delay = top.Delay });
+                            Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
                         }
                     }
-                }
-
-                var topScore = stabilityScores.TryGetValue(topNData[0].IP, out var bestScore) ? bestScore : double.MaxValue;
-                var betterCurrent = currentIpScores
-                    .Where(item => item.Value.Score < topScore)
-                    .OrderBy(item => item.Value.Score)
-                    .FirstOrDefault();
-
-                if (betterCurrent.Key != null)
-                {
-                    Console.WriteLine($"当前 IP {betterCurrent.Key} 评分 {betterCurrent.Value.Score:0.00}（延迟 {betterCurrent.Value.Average.TotalMilliseconds:0.00}ms）优于本轮最优 {topNData[0].IP} 评分 {topScore:0.00}，保留当前 IP 不覆盖");
-                    stabilityScores[betterCurrent.Key] = betterCurrent.Value.Score;
-                    topNData.Insert(0, new PingData { IP = betterCurrent.Key, Delay = betterCurrent.Value.Average });
-                    topNData = topNData
-                        .GroupBy(item => item.IP)
-                        .Select(group => group.First())
-                        .Take(3)
-                        .ToList();
-                }
-
-                // 种子库更新：本轮 HTTP 验证通过的 IP + 保留的当前 IP，按稳定性评分入库
-                var seedCandidates = new List<(IPAddress Ip, double Score, double DelayMs)>();
-                foreach (var candidate in topHttpList)
-                {
-                    if (stabilityScores.TryGetValue(candidate.IP, out var candidateScore))
+                    catch (Exception ex)
                     {
-                        seedCandidates.Add((candidate.IP, candidateScore, candidate.Delay.TotalMilliseconds));
+                        Console.WriteLine(ex.ToString());
                     }
-                }
-                foreach (var item in currentIpScores)
-                {
-                    if (!seedCandidates.Any(s => s.Ip.Equals(item.Key)))
+
+                    DashboardState.UpdateRun(run => run.DnsUpdates.Add(new DnsUpdateResult
                     {
-                        seedCandidates.Add((item.Key, item.Value.Score, item.Value.Average.TotalMilliseconds));
-                    }
-                }
-                if (seedCandidates.Count > 0)
-                {
-                    foreach (var item in seedCandidates)
-                    {
-                        seedPool.AddOrUpdate(item.Ip, item.Score, item.DelayMs);
-                    }
-                    Console.WriteLine($"种子库更新：本轮入库 {seedCandidates.Count} 个，当前共 {seedPool.Count} 个");
-                }
-                seedPool.Save();
-                DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
-
-                var top1Data = topNData[0];
-                var subnet24 = subnetCache.GetSubnet24(top1Data.IP);
-                if (subnet24 != null)
-                {
-                    subnetCache.AddOrUpdate(subnet24, top1Data.Delay.TotalMilliseconds);
-                    subnetCache.Save();
-                    Console.WriteLine($"已缓存子网 {subnet24} (HTTP延迟 {top1Data.Delay.TotalMilliseconds:0.00}ms，当前共{subnetCache.SubnetCount}个缓存子网)");
-                }
-
-                for (int rank = 0; rank < 3; rank++)
-                {
-                    foreach (var dnsUpdateProvider in dnsUpdateProviders)
-                    {
-                        var domains = dnsUpdateProvider.GetDomains(rank);
-                        if (domains.Length == 0)
-                        {
-                            continue;
-                        }
-
-                        if (rank >= topNData.Count)
-                        {
-                            Console.WriteLine($"可用IP不足，跳过 {dnsUpdateProvider.GetVariableName(rank)} 的DNS更新（需要第{rank + 1}名，实际只有{topNData.Count}个）");
-                            continue;
-                        }
-
-                        var rankedIp = topNData[rank];
-                        foreach (var domain in domains)
-                        {
-                            var updated = false;
-                            try
-                            {
-                                Console.WriteLine($"开始更新[{dnsUpdateProvider.ProviderName}]域名 {domain} {rankedIp.IP}（第{rank + 1}名）");
-                                DashboardState.SetSelectionDetail($"更新DNS {domain}");
-                                updated = await dnsUpdateProvider.Manager.AddOrUpdateARecord(domain, rankedIp.IP.ToString());
-                                if (updated)
-                                {
-                                    Console.WriteLine($"已完成更新[{dnsUpdateProvider.ProviderName}]域名 {domain}");
-                                    assignedIpsByRank.TryAdd(rank, rankedIp);
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"更新[{dnsUpdateProvider.ProviderName}]域名失败 {domain}");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine(ex.ToString());
-                            }
-
-                            DashboardState.UpdateRun(run => run.DnsUpdates.Add(new DnsUpdateResult
-                            {
-                                Provider = dnsUpdateProvider.ProviderName,
-                                Domain = domain,
-                                Rank = rank + 1,
-                                Ip = rankedIp.IP.ToString(),
-                                Success = updated
-                            }));
-                        }
-                    }
+                        Provider = provider.ProviderName,
+                        Domain = domain,
+                        Rank = 1,
+                        Ip = top.Ip.ToString(),
+                        Success = updated
+                    }));
                 }
             }
-            else
+
+            if (assignedIpsByRank.Count > 0)
             {
-                Console.WriteLine("最终阶段没有IP通过HTTP验证，跳过DNS更新");
+                switchState.MarkSwitched(top.Ip.ToString(), top.Score);
             }
 
-            Console.WriteLine("单次执行完毕");
             var assignedIps = assignedIpsByRank
                 .OrderBy(item => item.Key)
                 .Select(item => new AssignedIp(item.Value.IP, item.Value.Delay, item.Key + 1))

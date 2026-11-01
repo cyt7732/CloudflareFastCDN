@@ -18,7 +18,7 @@ namespace CloudflareFastCDN.Utils
     /// </summary>
     public class SeedPool
     {
-        private const int MaxSeeds = 100;
+        private const int MaxSeeds = 10;
         private const int FailureEvictThreshold = 2;
 
         private static readonly string PoolFile =
