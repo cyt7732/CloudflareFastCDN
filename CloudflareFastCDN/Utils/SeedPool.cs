@@ -62,6 +62,8 @@ namespace CloudflareFastCDN.Utils
             return _seeds.Any(r => r.Ip == s);
         }
 
+        public List<SeedRecord> GetEntries() => new(_seeds);
+
         /// <summary>
         /// 入库或更新：分数更低（更好）时更新，超过容量淘汰最差。
         /// </summary>

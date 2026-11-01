@@ -282,6 +282,16 @@ details summary { cursor: pointer; color: var(--text-secondary); }
     </div>
   </section>
 
+  <section class="card">
+    <h2>种子 IP 库 <span class="sub">历史评分最优的 IP，每轮优选优先复用（容量 100，按评分淘汰）</span></h2>
+    <div class="table-wrap scroll">
+      <table>
+        <thead><tr><th>#</th><th>IP</th><th class="num">评分</th><th class="num">平均延迟</th><th>最后命中</th></tr></thead>
+        <tbody id="seedBody"></tbody>
+      </table>
+    </div>
+  </section>
+
   <div class="filters" role="group" aria-label="时间范围">
     <span class="label">时间范围</span>
     <span class="seg" id="rangeSeg">
@@ -588,6 +598,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
       : `服务已运行 ${fmtDuration(serverNow() - new Date(status.startedAt).getTime())}`;
 
     renderAssigned(status);
+    renderSeedPool(status);
     tick();
   }
 
@@ -630,6 +641,25 @@ details summary { cursor: pointer; color: var(--text-secondary); }
         el('td', null, statusBadge(item.lastCheckOk, '正常', '检查失败')),
         el('td', { class: 'muted', text: domains || '—' })));
     }
+  }
+
+  function renderSeedPool(status) {
+    const body = $('seedBody');
+    if (!body) return;
+    body.replaceChildren();
+    const seeds = status.seedPool || [];
+    if (seeds.length === 0) {
+      body.append(el('tr', null, el('td', { colspan: '5', class: 'empty', text: '种子库为空，跑完一轮优选后自动填充' })));
+      return;
+    }
+    seeds.forEach((item, index) => {
+      body.append(el('tr', null,
+        el('td', { class: 'num', text: String(index + 1) }),
+        el('td', { class: 'mono', text: item.ip }),
+        el('td', { class: 'num', text: Number(item.score).toFixed(2) }),
+        el('td', { class: 'num', text: fmtMs(item.delayMs) }),
+        el('td', { class: 'muted', text: item.lastSeen || '—' })));
+    });
   }
 
   // ---------- 设置 ----------

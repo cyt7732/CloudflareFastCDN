@@ -32,6 +32,7 @@ namespace CloudflareFastCDN.Web
         private static List<SelectionRun> _runs = new();
         private static List<AssignedIpInfo> _assignedIps = new();
         private static List<DomainGroupInfo> _domainGroups = new();
+        private static List<SeedPoolEntry> _seedPool = new();
         private static DashboardPhase _phase = DashboardPhase.Starting;
         private static string? _phaseDetail;
         private static DateTimeOffset _phaseStartedAt = DateTimeOffset.Now;
@@ -63,6 +64,23 @@ namespace CloudflareFastCDN.Web
             lock (SyncRoot)
             {
                 _domainGroups = domainGroups;
+            }
+        }
+
+        public static void SetSeedPoolInfo(IEnumerable<(string Ip, double Score, double DelayMs, string LastSeen)> entries)
+        {
+            lock (SyncRoot)
+            {
+                _seedPool = entries
+                    .OrderBy(item => item.Score)
+                    .Select(item => new SeedPoolEntry
+                    {
+                        Ip = item.Ip,
+                        Score = Round(item.Score),
+                        DelayMs = Round(item.DelayMs),
+                        LastSeen = item.LastSeen
+                    })
+                    .ToList();
             }
         }
 
@@ -246,6 +264,7 @@ namespace CloudflareFastCDN.Web
                     },
                     AssignedIps = _assignedIps,
                     DomainGroups = _domainGroups,
+                    SeedPool = _seedPool,
                     CurrentRun = _currentRun,
                     CompletedRuns = _runs.Count,
                     LastRunFinishedAt = _runs.Count > 0 ? _runs[^1].FinishedAt : null,
@@ -361,6 +380,7 @@ namespace CloudflareFastCDN.Web
         public string? PendingAction { get; set; }
         public List<AssignedIpInfo> AssignedIps { get; set; } = new();
         public List<DomainGroupInfo> DomainGroups { get; set; } = new();
+        public List<SeedPoolEntry> SeedPool { get; set; } = new();
         public SelectionRun? CurrentRun { get; set; }
         public int CompletedRuns { get; set; }
         public DateTimeOffset? LastRunFinishedAt { get; set; }
@@ -446,5 +466,13 @@ namespace CloudflareFastCDN.Web
         public int Rank { get; set; }
         public string Provider { get; set; } = string.Empty;
         public List<string> Domains { get; set; } = new();
+    }
+
+    internal sealed class SeedPoolEntry
+    {
+        public string Ip { get; set; } = string.Empty;
+        public double Score { get; set; }
+        public double DelayMs { get; set; }
+        public string LastSeen { get; set; } = string.Empty;
     }
 }

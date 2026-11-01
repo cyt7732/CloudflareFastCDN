@@ -542,6 +542,7 @@ namespace CloudflareFastCDN
             {
                 Console.WriteLine($"种子库加载：{seedIps.Count} 个历史优质 IP");
             }
+            DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
 
             var ipAddresses = processor.LoadIPRanges();
             var sampleCount = Math.Max(0, AppConfig.MaxIps - seedIps.Count);
@@ -804,6 +805,7 @@ namespace CloudflareFastCDN
                 Console.WriteLine($"种子库更新：本轮入库 {topHttpList.Count} 个，当前共 {seedPool.Count} 个");
             }
             seedPool.Save();
+            DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
 
             var assignedIpsByRank = new Dictionary<int, PingData>();
 
