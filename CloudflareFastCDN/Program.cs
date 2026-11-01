@@ -45,6 +45,23 @@ namespace CloudflareFastCDN
             PrintStartupConfiguration(isDocker);
 
             DashboardState.Initialize();
+
+            // 启动时把磁盘上的种子库加载到管理页面，避免重启后显示为空
+            try
+            {
+                var startupSeedPool = new SeedPool();
+                startupSeedPool.Load();
+                DashboardState.SetSeedPoolInfo(startupSeedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
+                if (startupSeedPool.Count > 0)
+                {
+                    Console.WriteLine($"种子库已载入管理页面：{startupSeedPool.Count} 个 IP");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"加载种子库到管理页面失败：{ex.Message}");
+            }
+
             var webServer = await WebServer.StartAsync();
             if (webServer == null && !TryBuildDnsUpdateProviders(out _, out var configurationError))
             {
