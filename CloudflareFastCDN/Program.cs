@@ -792,27 +792,12 @@ namespace CloudflareFastCDN
                 topNData = new List<PingData>();
             }
 
-            // 种子库更新：本轮通过 HTTP 验证的 IP 按稳定性评分入库
-            if (topHttpList.Any())
-            {
-                foreach (var candidate in topHttpList)
-                {
-                    if (stabilityScores.TryGetValue(candidate.IP, out var seedScore))
-                    {
-                        seedPool.AddOrUpdate(candidate.IP, seedScore, candidate.Delay.TotalMilliseconds);
-                    }
-                }
-                Console.WriteLine($"种子库更新：本轮入库 {topHttpList.Count} 个，当前共 {seedPool.Count} 个");
-            }
-            seedPool.Save();
-            DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
-
             var assignedIpsByRank = new Dictionary<int, PingData>();
 
             if (topNData.Count > 0)
             {
                 // 与当前正在使用的 IP 对比：现有 IP 更快时保留，避免被更差的候选覆盖
-                var currentIpDelays = new Dictionary<IPAddress, TimeSpan>();
+                var currentIpScores = new Dictionary<IPAddress, (TimeSpan Average, double Score)>();
                 foreach (var provider in dnsUpdateProviders)
                 {
                     foreach (var domain in provider.GetDomains(0))
@@ -822,7 +807,7 @@ namespace CloudflareFastCDN
                             var addresses = await Dns.GetHostAddressesAsync(domain);
                             foreach (var address in addresses.Where(item => item.AddressFamily == AddressFamily.InterNetwork))
                             {
-                                if (currentIpDelays.ContainsKey(address))
+                                if (currentIpScores.ContainsKey(address))
                                 {
                                     continue;
                                 }
@@ -831,8 +816,17 @@ namespace CloudflareFastCDN
                                 if (probe.success >= HttpMinSuccessCount)
                                 {
                                     var average = TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success);
-                                    currentIpDelays[address] = average;
-                                    Console.WriteLine($"当前使用中的 IP {address}（{domain}）HTTP延迟 {average.TotalMilliseconds:0.00}ms");
+                                    var cv = 0d;
+                                    if (probe.delays.Count > 1 && average.TotalMilliseconds > 0)
+                                    {
+                                        var mean = average.TotalMilliseconds;
+                                        var variance = probe.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
+                                        cv = Math.Sqrt(variance) / mean;
+                                    }
+                                    var lossRate = 1d - (double)probe.success / HttpProbeCount;
+                                    var score = average.TotalMilliseconds * (1 + cv) * (1 + lossRate);
+                                    currentIpScores[address] = (average, score);
+                                    Console.WriteLine($"当前使用中的 IP {address}（{domain}）HTTP延迟 {average.TotalMilliseconds:0.00}ms 评分 {score:0.00}");
                                 }
                             }
                         }
@@ -843,21 +837,50 @@ namespace CloudflareFastCDN
                     }
                 }
 
-                var betterCurrent = currentIpDelays
-                    .Where(item => item.Value < topNData[0].Delay)
-                    .OrderBy(item => item.Value)
+                var topScore = stabilityScores.TryGetValue(topNData[0].IP, out var bestScore) ? bestScore : double.MaxValue;
+                var betterCurrent = currentIpScores
+                    .Where(item => item.Value.Score < topScore)
+                    .OrderBy(item => item.Value.Score)
                     .FirstOrDefault();
 
                 if (betterCurrent.Key != null)
                 {
-                    Console.WriteLine($"当前 IP {betterCurrent.Key} 延迟 {betterCurrent.Value.TotalMilliseconds:0.00}ms 优于本轮最优 {topNData[0].IP} {topNData[0].Delay.TotalMilliseconds:0.00}ms，保留当前 IP 不覆盖");
-                    topNData.Insert(0, new PingData { IP = betterCurrent.Key, Delay = betterCurrent.Value });
+                    Console.WriteLine($"当前 IP {betterCurrent.Key} 评分 {betterCurrent.Value.Score:0.00}（延迟 {betterCurrent.Value.Average.TotalMilliseconds:0.00}ms）优于本轮最优 {topNData[0].IP} 评分 {topScore:0.00}，保留当前 IP 不覆盖");
+                    stabilityScores[betterCurrent.Key] = betterCurrent.Value.Score;
+                    topNData.Insert(0, new PingData { IP = betterCurrent.Key, Delay = betterCurrent.Value.Average });
                     topNData = topNData
                         .GroupBy(item => item.IP)
                         .Select(group => group.First())
                         .Take(3)
                         .ToList();
                 }
+
+                // 种子库更新：本轮 HTTP 验证通过的 IP + 保留的当前 IP，按稳定性评分入库
+                var seedCandidates = new List<(IPAddress Ip, double Score, double DelayMs)>();
+                foreach (var candidate in topHttpList)
+                {
+                    if (stabilityScores.TryGetValue(candidate.IP, out var candidateScore))
+                    {
+                        seedCandidates.Add((candidate.IP, candidateScore, candidate.Delay.TotalMilliseconds));
+                    }
+                }
+                foreach (var item in currentIpScores)
+                {
+                    if (!seedCandidates.Any(s => s.Ip.Equals(item.Key)))
+                    {
+                        seedCandidates.Add((item.Key, item.Value.Score, item.Value.Average.TotalMilliseconds));
+                    }
+                }
+                if (seedCandidates.Count > 0)
+                {
+                    foreach (var item in seedCandidates)
+                    {
+                        seedPool.AddOrUpdate(item.Ip, item.Score, item.DelayMs);
+                    }
+                    Console.WriteLine($"种子库更新：本轮入库 {seedCandidates.Count} 个，当前共 {seedPool.Count} 个");
+                }
+                seedPool.Save();
+                DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
 
                 var top1Data = topNData[0];
                 var subnet24 = subnetCache.GetSubnet24(top1Data.IP);
