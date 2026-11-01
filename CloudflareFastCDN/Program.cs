@@ -421,6 +421,14 @@ namespace CloudflareFastCDN
                 return request.Trigger;
             }
 
+            // 定时到达：直接跑一轮优选（持续探索），不再用「复检通过就跳过」
+            if (request.Command == ManualCommand.None)
+            {
+                Console.WriteLine("到达定时优选时间，直接开始全量优选（不复检跳过）");
+                return "定时触发";
+            }
+
+            // 手动复检：只做健康检查
             var manual = request.Command == ManualCommand.Revalidate;
             if (await ValidateAssignedIps(selection.AssignedIps, manual))
             {
@@ -432,7 +440,7 @@ namespace CloudflareFastCDN
                 return "无可用IP";
             }
 
-            return manual ? "手动复检未通过" : "定时复检未通过";
+            return "手动复检未通过";
         }
 
         private static async Task<bool> ValidateAssignedIps(IReadOnlyList<AssignedIp> assignedIps, bool manual)
