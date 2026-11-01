@@ -535,8 +535,31 @@ namespace CloudflareFastCDN
             var subnetCache = new SubnetCache();
             subnetCache.Load();
 
+            var seedPool = new SeedPool();
+            seedPool.Load();
+            var seedIps = seedPool.GetIPs();
+            if (seedIps.Count > 0)
+            {
+                Console.WriteLine($"种子库加载：{seedIps.Count} 个历史优质 IP");
+            }
+
             var ipAddresses = processor.LoadIPRanges();
-            ipAddresses = SampleData(ipAddresses, AppConfig.MaxIps);
+            var sampleCount = Math.Max(0, AppConfig.MaxIps - seedIps.Count);
+            ipAddresses = SampleData(ipAddresses, sampleCount);
+
+            // 合并种子 IP（去重后追加）
+            if (seedIps.Count > 0)
+            {
+                var seedSet = new HashSet<IPAddress>(seedIps);
+                var merged = new List<IPAddress>(seedIps);
+                foreach (var ip in ipAddresses)
+                {
+                    if (!seedSet.Contains(ip))
+                        merged.Add(ip);
+                }
+                Console.WriteLine($"本轮候选：{merged.Count} 个（种子 {seedIps.Count} + 抽样 {ipAddresses.Count}）");
+                ipAddresses = merged;
+            }
 
             TcpPing task = new TcpPing(ipAddresses, FirstRoundPingCount);
             Console.WriteLine($"开始第1轮检查：TCP Ping 全量{FirstRoundPingCount}次");
@@ -644,6 +667,10 @@ namespace CloudflareFastCDN
                     stabilityScores[ip.IP] = score;
                     Console.WriteLine($"  → 稳定性评分 {score:0.00}（变异系数 {cv:0.00}，丢包率 {lossRate:P0}）");
                     topHttpList.Add(ip);
+                }
+                else if (seedPool.Contains(ip.IP))
+                {
+                    seedPool.RecordFailure(ip.IP);
                 }
 
                 DashboardState.UpdateRun(run =>
@@ -763,6 +790,20 @@ namespace CloudflareFastCDN
             {
                 topNData = new List<PingData>();
             }
+
+            // 种子库更新：本轮通过 HTTP 验证的 IP 按稳定性评分入库
+            if (topHttpList.Any())
+            {
+                foreach (var candidate in topHttpList)
+                {
+                    if (stabilityScores.TryGetValue(candidate.IP, out var seedScore))
+                    {
+                        seedPool.AddOrUpdate(candidate.IP, seedScore, candidate.Delay.TotalMilliseconds);
+                    }
+                }
+                Console.WriteLine($"种子库更新：本轮入库 {topHttpList.Count} 个，当前共 {seedPool.Count} 个");
+            }
+            seedPool.Save();
 
             var assignedIpsByRank = new Dictionary<int, PingData>();
 
