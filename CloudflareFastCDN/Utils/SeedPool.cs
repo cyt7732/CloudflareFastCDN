@@ -79,11 +79,9 @@ namespace CloudflareFastCDN.Utils
 
             if (existing != null)
             {
-                if (score < existing.Score)
-                {
-                    existing.Score = score;
-                    existing.DelayMs = delayMs;
-                }
+                // 每轮全测，直接用本轮结果覆盖，反映当前真实状态
+                existing.Score = score;
+                existing.DelayMs = delayMs;
                 existing.ConsecutiveFailures = 0;
                 existing.LastSeen = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             }

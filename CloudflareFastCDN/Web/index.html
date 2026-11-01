@@ -237,8 +237,8 @@ details summary { cursor: pointer; color: var(--text-secondary); }
   <span id="phasePill" class="phase-pill"><span class="dot"></span><span id="phaseText">连接中…</span></span>
   <span id="conn" class="conn"></span>
   <span class="spacer"></span>
-  <button id="btnRevalidate" type="button" title="提前结束等待，立即复检已分配的IP；复检不通过时自动进入全量优选">立即复检</button>
-  <button id="btnSelect" type="button" class="primary" title="立即执行一次全量优选并更新DNS记录">立即优选</button>
+  <button id="btnRevalidate" type="button" title="立即检查当前 IP 是否健康（不等 5 分钟周期）；不通过时自动进入灾备或全量优选">立即复检</button>
+  <button id="btnSelect" type="button" class="primary" title="立即执行一轮完整优选（约15分钟）：20个候选全测，按切换策略（需好15%以上且不在冷却期）决定是否换 IP">立即优选</button>
 </header>
 
 <main>

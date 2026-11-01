@@ -100,6 +100,19 @@ namespace CloudflareFastCDN.Utils
             Save();
         }
 
+        /// <summary>
+        /// 初始化基准（首次运行或状态文件丢失时，从当前 DNS 记录反推）。
+        /// 不设置冷却期，避免刚启动就误判。
+        /// </summary>
+        public void Initialize(string ip, double score)
+        {
+            CurrentIp = ip;
+            CurrentScore = score;
+            LastSwitchAt = string.Empty;
+            ConsecutiveFailures = 0;
+            Save();
+        }
+
         public void RecordFailure()
         {
             ConsecutiveFailures++;

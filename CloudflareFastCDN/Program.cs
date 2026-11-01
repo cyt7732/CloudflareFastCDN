@@ -503,6 +503,56 @@ namespace CloudflareFastCDN
         }
 
         /// <summary>
+        /// 从 DNS 服务商 API 读取当前 A 记录，测出它的评分，用于初始化切换基准。
+        /// </summary>
+        private static async Task<(string Ip, double Score)?> ProbeCurrentDnsIps(IReadOnlyList<DnsUpdateProvider> providers)
+        {
+            var httpPing = new Httping();
+            foreach (var provider in providers)
+            {
+                foreach (var domain in provider.GetDomains(0))
+                {
+                    IReadOnlyList<string> apiIps;
+                    try
+                    {
+                        apiIps = await provider.Manager.GetARecordIps(domain);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    foreach (var ipStr in apiIps)
+                    {
+                        if (!IPAddress.TryParse(ipStr, out var ip))
+                        {
+                            continue;
+                        }
+
+                        var probe = await httpPing.PingWithOutcome(ip, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
+                        if (probe.success < HttpMinSuccessCount)
+                        {
+                            continue;
+                        }
+
+                        var avg = TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success);
+                        var cv = 0d;
+                        if (probe.delays.Count > 1 && avg.TotalMilliseconds > 0)
+                        {
+                            var mean = avg.TotalMilliseconds;
+                            var variance = probe.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
+                            cv = Math.Sqrt(variance) / mean;
+                        }
+                        var lossRate = 1d - (double)probe.success / HttpProbeCount;
+                        var score = avg.TotalMilliseconds * (1 + cv) * (1 + lossRate);
+                        return (ip.ToString(), score);
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
         /// 灾备：当前 IP 连续失败时，从种子库快速选一个可用 IP 换上。
         /// 只做 TCP 快速探测，不跑全量优选。
         /// </summary>
@@ -650,6 +700,21 @@ namespace CloudflareFastCDN
             subnetTable.Load();
             var switchState = SwitchState.Load();
 
+            // 状态丢失时，从当前 DNS 记录反推基准，避免误判「首次分配」导致乱换
+            if (string.IsNullOrEmpty(switchState.CurrentIp))
+            {
+                var baseline = await ProbeCurrentDnsIps(dnsUpdateProviders);
+                if (baseline.HasValue)
+                {
+                    switchState.Initialize(baseline.Value.Ip, baseline.Value.Score);
+                    Console.WriteLine($"切换基准初始化：{baseline.Value.Ip} 评分 {baseline.Value.Score:0.00}（从当前 DNS 记录反推）");
+                }
+                else
+                {
+                    Console.WriteLine("无法读取当前 DNS 记录，本轮按首次分配处理");
+                }
+            }
+
             var seedIps = seedPool.GetIPs();
             if (seedIps.Count > 0)
             {
@@ -660,9 +725,10 @@ namespace CloudflareFastCDN
             // 1. 抽样：70% 网段加权 + 30% 全量随机
             var allIps = processor.LoadIPRanges();
             var weightedCount = (int)Math.Round(AppConfig.MaxIps * 0.7);
-            var randomCount = Math.Max(0, AppConfig.MaxIps - weightedCount);
             var rng = new Random();
             var weightedIps = subnetTable.SampleWeighted(weightedCount, rng);
+            // 加权抽样不足时用全量随机补足，保证总数达到 MAX_IPS
+            var randomCount = Math.Max(0, AppConfig.MaxIps - weightedIps.Count);
             var randomIps = SampleData(allIps, randomCount);
             var sampledIps = weightedIps.Concat(randomIps).Distinct().ToList();
 
