@@ -16,8 +16,8 @@ namespace CloudflareFastCDN
         private const int FinalHttpCandidateCount = 10;
         private const int FinalSecondRoundCandidateCount = 7;
         private const int FinalCachedCandidateCount = 3;
-        private const int HttpProbeCount = 3;
-        private const int HttpMinSuccessCount = 2;
+        private const int HttpProbeCount = 5;
+        private const int HttpMinSuccessCount = 4;
         private const double AssignedDelayMaxMultiplier = 2d;
         private static readonly TimeSpan AssignedDelayMinimumThreshold = TimeSpan.FromMilliseconds(300);
         private static readonly TimeSpan FinalProbeMinInterval = TimeSpan.FromSeconds(5);
