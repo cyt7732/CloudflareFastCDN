@@ -395,7 +395,17 @@ namespace CloudflareFastCDN
                 var healthy = await RunSupplementalHttpCheck(selection.AssignedIps[0]);
                 if (!healthy)
                 {
-                    Console.WriteLine($"补充HTTP检查连续{SupplementalHttpCheckCount}次失败，立即开始重新优选并重新计时");
+                    Console.WriteLine($"补充HTTP检查连续{SupplementalHttpCheckCount}次失败，启动灾备快速切换");
+                    var failover = await RunFailover();
+                    if (failover != null)
+                    {
+                        selection = failover;
+                        nextRunAt = TimestampedConsole.Now + TimeSpan.FromMinutes(AppConfig.RunMinutes);
+                        DashboardState.SetWaiting(nextRunAt);
+                        continue;
+                    }
+
+                    Console.WriteLine("灾备失败，退回全量优选");
                     return "补充检查失败";
                 }
 
@@ -490,6 +500,74 @@ namespace CloudflareFastCDN
 
             Console.WriteLine("已分配IP复检均正常，本周期跳过全量优选");
             return true;
+        }
+
+        /// <summary>
+        /// 灾备：当前 IP 连续失败时，从种子库快速选一个可用 IP 换上。
+        /// 只做 TCP 快速探测，不跑全量优选。
+        /// </summary>
+        private static async Task<SelectionResult?> RunFailover()
+        {
+            Console.WriteLine("=== 灾备模式：从种子库快速选 IP ===");
+            var seedPool = new SeedPool();
+            seedPool.Load();
+            var seedIps = seedPool.GetIPs();
+            if (seedIps.Count == 0)
+            {
+                Console.WriteLine("种子库为空，无法灾备，退回全量优选");
+                return null;
+            }
+
+            var tcpPing = new TcpPing(seedIps, 2);
+            var results = await tcpPing.RunAsync();
+            var passed = results.Where(item => item.Received > 0).ToList();
+            if (passed.Count == 0)
+            {
+                Console.WriteLine("种子库 IP 全部不可用，退回全量优选");
+                return null;
+            }
+
+            var best = passed[0];
+            Console.WriteLine($"灾备选择：{best.IP}（TCP {best.Delay.TotalMilliseconds:0.00}ms，通过 {passed.Count}/{seedIps.Count}）");
+
+            var dnsUpdateProviders = await GetDnsUpdateProviders();
+            var assignedIpsByRank = new Dictionary<int, PingData>();
+            foreach (var provider in dnsUpdateProviders)
+            {
+                foreach (var domain in provider.GetDomains(0))
+                {
+                    try
+                    {
+                        var updated = await provider.Manager.AddOrUpdateARecord(domain, best.IP.ToString());
+                        if (updated)
+                        {
+                            assignedIpsByRank.TryAdd(0, best);
+                            Console.WriteLine($"灾备更新[{provider.ProviderName}] {domain} → {best.IP}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"灾备更新失败 {domain}：{ex.Message}");
+                    }
+                }
+            }
+
+            if (assignedIpsByRank.Count == 0)
+            {
+                Console.WriteLine("灾备更新 DNS 全部失败，退回全量优选");
+                return null;
+            }
+
+            var switchState = SwitchState.Load();
+            switchState.MarkSwitched(best.IP.ToString(), 0);
+            switchState.Save();
+
+            var assignedIps = assignedIpsByRank
+                .OrderBy(item => item.Key)
+                .Select(item => new AssignedIp(item.Value.IP, item.Value.Delay, item.Key + 1))
+                .ToList();
+            Console.WriteLine($"灾备完成：{assignedIps[0].IP}");
+            return new SelectionResult(assignedIps);
         }
 
         private static async Task<bool> RunSupplementalHttpCheck(AssignedIp assignedIp)
