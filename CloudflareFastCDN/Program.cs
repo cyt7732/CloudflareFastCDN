@@ -364,7 +364,7 @@ namespace CloudflareFastCDN
             }
             else
             {
-                Console.WriteLine($"等待{AppConfig.RunMinutes}分钟；期间每{SupplementalHttpCheckInterval.TotalMinutes:0}分钟对 {selection.AssignedIps[0].IP} 进行补充HTTP检查，到期后复检{selection.AssignedIps.Count}个已分配IP");
+                Console.WriteLine($"等待{AppConfig.RunMinutes}分钟；期间每{SupplementalHttpCheckInterval.TotalMinutes:0}分钟对 {selection.AssignedIps[0].IP} 进行补充HTTP检查，到期后直接开始新一轮优选");
             }
 
             while (true)
@@ -506,7 +506,7 @@ namespace CloudflareFastCDN
                 }
             }
 
-            Console.WriteLine("已分配IP复检均正常，本周期跳过全量优选");
+            Console.WriteLine("已分配IP复检均正常");
             return true;
         }
 
