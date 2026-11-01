@@ -11,7 +11,7 @@ namespace CloudflareFastCDN
     {
         private const int FirstRoundPingCount = 4;
         private const int SecondRoundPingCount = 5;
-        private const int SecondRoundMaxPacketLoss = 0;
+        private const int SecondRoundMaxPacketLoss = 1;
         private const double SecondRoundCandidateRatio = 0.25d;
         private const int FinalHttpCandidateCount = 10;
         private const int FinalSecondRoundCandidateCount = 7;
@@ -25,7 +25,7 @@ namespace CloudflareFastCDN
         private static readonly TimeSpan FinalCandidateMinInterval = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan FinalCandidateMaxInterval = TimeSpan.FromSeconds(45);
         private const int SubnetProbePingCount = 2;
-        private const int SubnetSampleCount = 3;
+        private const int SubnetSampleCount = 6;
         private static readonly TimeSpan SupplementalHttpCheckInterval = TimeSpan.FromMinutes(5);
         private const int SupplementalHttpCheckCount = 3;
 
@@ -538,17 +538,17 @@ namespace CloudflareFastCDN
             var ipAddresses = processor.LoadIPRanges();
             ipAddresses = SampleData(ipAddresses, AppConfig.MaxIps);
 
-            IcmpPing task = new IcmpPing(ipAddresses, FirstRoundPingCount);
-            Console.WriteLine($"开始第1轮检查：全量{FirstRoundPingCount}次Ping");
-            DashboardState.UpdateRun(run => run.Sampled = ipAddresses.Count, $"第1轮ICMP Ping（{ipAddresses.Count}个IP）");
+            TcpPing task = new TcpPing(ipAddresses, FirstRoundPingCount);
+            Console.WriteLine($"开始第1轮检查：TCP Ping 全量{FirstRoundPingCount}次");
+            DashboardState.UpdateRun(run => run.Sampled = ipAddresses.Count, $"第1轮TCP Ping（{ipAddresses.Count}个IP）");
             var firstRoundResults = await task.RunAsync();
-            var topPings = firstRoundResults.Where(item => item.Sended == FirstRoundPingCount && item.Received == item.Sended).ToList();
+            var topPings = firstRoundResults.Where(item => item.Sended == FirstRoundPingCount && item.Received >= FirstRoundPingCount - 1).ToList();
             var secondRoundCandidateLimit = CalculateSecondRoundCandidateCount(ipAddresses.Count);
             var secondRoundPings = topPings.Take(secondRoundCandidateLimit).ToList();
 
             Console.WriteLine($"开始第2轮检查：第1轮前{secondRoundPings.Count}名（抽样{ipAddresses.Count}个，前{SecondRoundCandidateRatio:P0}上限{secondRoundCandidateLimit}个），{SecondRoundPingCount}次Ping，允许最多丢包{SecondRoundMaxPacketLoss}/{SecondRoundPingCount}");
             DashboardState.UpdateRun(run => run.FirstRoundPassed = topPings.Count, $"第2轮ICMP Ping（{secondRoundPings.Count}个IP）");
-            IcmpPing secondRoundPingTask = new IcmpPing(secondRoundPings.Select(item => item.IP).ToList(), SecondRoundPingCount);
+            TcpPing secondRoundPingTask = new TcpPing(secondRoundPings.Select(item => item.IP).ToList(), SecondRoundPingCount);
             var secondRoundResults = await secondRoundPingTask.RunAsync();
             var secondRoundPassed = secondRoundResults
                 .Where(item => item.Sended == SecondRoundPingCount && item.Sended - item.Received <= SecondRoundMaxPacketLoss)
@@ -568,7 +568,10 @@ namespace CloudflareFastCDN
                 DashboardState.UpdateRun(run => run.CachedSampled = sampledSubnets.Count, $"子网缓存TCP Ping（{sampledSubnets.Count}个IP）");
                 TcpPing subnetTcpPing = new TcpPing(sampledSubnets.Select(item => item.IP).ToList(), SubnetProbePingCount);
                 var subnetResults = await subnetTcpPing.RunAsync();
-                var subnetPassed = subnetResults.Where(result => result.Received > 0).ToList();
+                var subnetPassed = subnetResults
+                    .Where(result => result.Received > 0)
+                    .OrderBy(result => result.Delay.TotalMilliseconds * (1 + (double)(result.Sended - result.Received) / Math.Max(1, result.Sended)))
+                    .ToList();
                 Console.WriteLine($"子网缓存阶段：{subnetPassed.Count}/{sampledSubnets.Count}个IP通过TCP Ping，加入最终候选");
                 DashboardState.UpdateRun(run => run.CachedPassed = subnetPassed.Count);
                 cachedCandidateIps.UnionWith(subnetPassed.Select(result => result.IP));
@@ -609,6 +612,7 @@ namespace CloudflareFastCDN
             DashboardState.UpdateRun(run => run.HttpCandidates = httpCandidates.Count);
             int count = 0;
             List<PingData> topHttpList = new List<PingData>();
+            var stabilityScores = new Dictionary<IPAddress, double>();
             var httpPing = new Httping();
             foreach (var ip in httpCandidates)
             {
@@ -627,6 +631,18 @@ namespace CloudflareFastCDN
                 if (candidatePassed)
                 {
                     ip.Delay = averageDelay;
+                    // 稳定性评分：平均延迟 × (1 + 变异系数) × (1 + 丢包率)
+                    var cv = 0d;
+                    if (pingResult.delays.Count > 1 && averageDelay.TotalMilliseconds > 0)
+                    {
+                        var mean = averageDelay.TotalMilliseconds;
+                        var variance = pingResult.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
+                        cv = Math.Sqrt(variance) / mean;
+                    }
+                    var lossRate = 1d - (double)pingResult.success / HttpProbeCount;
+                    var score = averageDelay.TotalMilliseconds * (1 + cv) * (1 + lossRate);
+                    stabilityScores[ip.IP] = score;
+                    Console.WriteLine($"  → 稳定性评分 {score:0.00}（变异系数 {cv:0.00}，丢包率 {lossRate:P0}）");
                     topHttpList.Add(ip);
                 }
 
@@ -659,12 +675,17 @@ namespace CloudflareFastCDN
             {
                 if (!AppConfig.BandwidthPriority)
                 {
-                    topHttpList.Sort((left, right) => left.Delay.TotalMicroseconds.CompareTo(right.Delay.TotalMicroseconds));
+                    topHttpList.Sort((left, right) =>
+                    {
+                        var leftScore = stabilityScores.TryGetValue(left.IP, out var ls) ? ls : double.MaxValue;
+                        var rightScore = stabilityScores.TryGetValue(right.IP, out var rs) ? rs : double.MaxValue;
+                        return leftScore.CompareTo(rightScore);
+                    });
                     topNData = topHttpList.Take(3).ToList();
 
                     if (topNData.Count > 0)
                     {
-                        Console.WriteLine($"当前为连接速度优先，按HTTP延迟选择IP {topNData[0].IP} {topNData[0].Delay.TotalMilliseconds:0.00}ms");
+                        Console.WriteLine($"当前为连接速度优先，按稳定性评分选择IP {topNData[0].IP} 评分{stabilityScores.GetValueOrDefault(topNData[0].IP):0.00}（延迟 {topNData[0].Delay.TotalMilliseconds:0.00}ms）");
                     }
                 }
                 else
@@ -723,12 +744,17 @@ namespace CloudflareFastCDN
                     }
                     else
                     {
-                        topHttpList.Sort((left, right) => left.Delay.TotalMicroseconds.CompareTo(right.Delay.TotalMicroseconds));
+                        topHttpList.Sort((left, right) =>
+                        {
+                            var leftScore = stabilityScores.TryGetValue(left.IP, out var ls) ? ls : double.MaxValue;
+                            var rightScore = stabilityScores.TryGetValue(right.IP, out var rs) ? rs : double.MaxValue;
+                            return leftScore.CompareTo(rightScore);
+                        });
                         topNData = topHttpList.Take(3).ToList();
 
                         if (topNData.Count > 0)
                         {
-                            Console.WriteLine($"下载测速不可用，回退到HTTP延迟选择IP {topNData[0].IP} {topNData[0].Delay.TotalMilliseconds:0.00}ms");
+                            Console.WriteLine($"下载测速不可用，回退到稳定性评分选择IP {topNData[0].IP} 评分{stabilityScores.GetValueOrDefault(topNData[0].IP):0.00}（延迟 {topNData[0].Delay.TotalMilliseconds:0.00}ms）");
                         }
                     }
                 }

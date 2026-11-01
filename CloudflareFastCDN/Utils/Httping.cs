@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
@@ -18,7 +19,7 @@ namespace CloudflareFastCDN.Utils
             return (result.success, result.totalDelay, result.error);
         }
 
-        internal async Task<(int success, TimeSpan totalDelay, string error, bool skipNode)> PingWithOutcome(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null)
+        internal async Task<(int success, TimeSpan totalDelay, string error, bool skipNode, List<TimeSpan> delays)> PingWithOutcome(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null)
         {
             var probeTimeout = TimeSpan.FromMilliseconds(AppConfig.HttpProbeTimeoutMs);
             using var client = CreateClient(ip, probeTimeout);
@@ -26,6 +27,7 @@ namespace CloudflareFastCDN.Utils
             int success = 0;
             TimeSpan totalDelay = TimeSpan.Zero;
             string lastError = string.Empty;
+            var delays = new List<TimeSpan>();
 
             for (int i = 0; i < pingCount; i++)
             {
@@ -34,6 +36,7 @@ namespace CloudflareFastCDN.Utils
                 {
                     success++;
                     totalDelay += pingResult.delay;
+                    delays.Add(pingResult.delay);
                 }
                 else
                 {
@@ -42,7 +45,7 @@ namespace CloudflareFastCDN.Utils
 
                 if (pingResult.skipNode)
                 {
-                    return (success, totalDelay, lastError, true);
+                    return (success, totalDelay, lastError, true, delays);
                 }
 
                 if (pingResult.shouldBackoff)
@@ -59,7 +62,7 @@ namespace CloudflareFastCDN.Utils
                 }
             }
 
-            return (success, totalDelay, lastError, false);
+            return (success, totalDelay, lastError, false, delays);
         }
 
         public async Task<(bool success, TimeSpan delay, string error)> SinglePing(IPAddress ip, bool pauseAfterBackoff = true)
