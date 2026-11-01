@@ -742,6 +742,54 @@ namespace CloudflareFastCDN
 
             if (topNData.Count > 0)
             {
+                // 与当前正在使用的 IP 对比：现有 IP 更快时保留，避免被更差的候选覆盖
+                var currentIpDelays = new Dictionary<IPAddress, TimeSpan>();
+                foreach (var provider in dnsUpdateProviders)
+                {
+                    foreach (var domain in provider.GetDomains(0))
+                    {
+                        try
+                        {
+                            var addresses = await Dns.GetHostAddressesAsync(domain);
+                            foreach (var address in addresses.Where(item => item.AddressFamily == AddressFamily.InterNetwork))
+                            {
+                                if (currentIpDelays.ContainsKey(address))
+                                {
+                                    continue;
+                                }
+
+                                var probe = await httpPing.PingWithOutcome(address, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
+                                if (probe.success >= HttpMinSuccessCount)
+                                {
+                                    var average = TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success);
+                                    currentIpDelays[address] = average;
+                                    Console.WriteLine($"当前使用中的 IP {address}（{domain}）HTTP延迟 {average.TotalMilliseconds:0.00}ms");
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"检测当前 IP 失败 {domain}：{FormatError(ex.Message)}");
+                        }
+                    }
+                }
+
+                var betterCurrent = currentIpDelays
+                    .Where(item => item.Value < topNData[0].Delay)
+                    .OrderBy(item => item.Value)
+                    .FirstOrDefault();
+
+                if (betterCurrent.Key != null)
+                {
+                    Console.WriteLine($"当前 IP {betterCurrent.Key} 延迟 {betterCurrent.Value.TotalMilliseconds:0.00}ms 优于本轮最优 {topNData[0].IP} {topNData[0].Delay.TotalMilliseconds:0.00}ms，保留当前 IP 不覆盖");
+                    topNData.Insert(0, new PingData { IP = betterCurrent.Key, Delay = betterCurrent.Value });
+                    topNData = topNData
+                        .GroupBy(item => item.IP)
+                        .Select(group => group.First())
+                        .Take(3)
+                        .ToList();
+                }
+
                 var top1Data = topNData[0];
                 var subnet24 = subnetCache.GetSubnet24(top1Data.IP);
                 if (subnet24 != null)
