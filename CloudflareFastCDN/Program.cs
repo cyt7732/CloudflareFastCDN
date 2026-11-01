@@ -240,28 +240,44 @@ namespace CloudflareFastCDN
                 {
                     foreach (var domain in dnsUpdateProvider.GetDomains(rank))
                     {
-                        IPAddress[] addresses;
-                        try
+                        // 优先直接查 DNS 服务商 API，避开本地 DNS 缓存导致的「同一域名解析出不同 IP」
+                        var apiIps = await dnsUpdateProvider.Manager.GetARecordIps(domain);
+                        List<IPAddress> ipv4Addresses;
+                        if (apiIps.Count > 0)
                         {
-                            addresses = await Dns.GetHostAddressesAsync(domain);
+                            ipv4Addresses = apiIps
+                                .Select(ip => IPAddress.TryParse(ip, out var parsed) ? parsed : null)
+                                .Where(ip => ip != null && ip.AddressFamily == AddressFamily.InterNetwork)
+                                .Select(ip => ip!)
+                                .Distinct()
+                                .ToList();
                         }
-                        catch (Exception ex)
+                        else
                         {
-                            Console.WriteLine($"首次域名预检解析失败：{domain}，原因：{FormatError(ex.Message)}，开始全量优选");
-                            return null;
+                            IPAddress[] addresses;
+                            try
+                            {
+                                addresses = await Dns.GetHostAddressesAsync(domain);
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"首次域名预检解析失败：{domain}，原因：{FormatError(ex.Message)}，开始全量优选");
+                                return null;
+                            }
+
+                            ipv4Addresses = addresses
+                                .Where(address => address.AddressFamily == AddressFamily.InterNetwork)
+                                .Distinct()
+                                .ToList();
                         }
 
-                        var ipv4Addresses = addresses
-                            .Where(address => address.AddressFamily == AddressFamily.InterNetwork)
-                            .Distinct()
-                            .ToList();
                         if (ipv4Addresses.Count == 0)
                         {
                             Console.WriteLine($"首次域名预检未解析到IPv4地址：{domain}，开始全量优选");
                             return null;
                         }
 
-                        Console.WriteLine($"首次域名预检解析：{domain} -> {string.Join(", ", ipv4Addresses)}");
+                        Console.WriteLine($"首次域名预检解析（{(apiIps.Count > 0 ? "API" : "本地DNS")}）：{domain} -> {string.Join(", ", ipv4Addresses)}");
                         foreach (var ip in ipv4Addresses)
                         {
                             if (!resolvedIps.TryGetValue(ip, out var resolvedIp))
@@ -821,8 +837,27 @@ namespace CloudflareFastCDN
                     {
                         try
                         {
-                            var addresses = await Dns.GetHostAddressesAsync(domain);
-                            foreach (var address in addresses.Where(item => item.AddressFamily == AddressFamily.InterNetwork))
+                            var apiIps = await provider.Manager.GetARecordIps(domain);
+                            List<IPAddress> addresses;
+                            if (apiIps.Count > 0)
+                            {
+                                addresses = apiIps
+                                    .Select(ip => IPAddress.TryParse(ip, out var parsed) ? parsed : null)
+                                    .Where(ip => ip != null && ip.AddressFamily == AddressFamily.InterNetwork)
+                                    .Select(ip => ip!)
+                                    .Distinct()
+                                    .ToList();
+                            }
+                            else
+                            {
+                                var resolved = await Dns.GetHostAddressesAsync(domain);
+                                addresses = resolved
+                                    .Where(item => item.AddressFamily == AddressFamily.InterNetwork)
+                                    .Distinct()
+                                    .ToList();
+                            }
+
+                            foreach (var address in addresses)
                             {
                                 if (currentIpScores.ContainsKey(address))
                                 {

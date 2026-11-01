@@ -67,6 +67,22 @@ namespace CloudflareFastCDN.Services
             return true;
         }
 
+        public async Task<IReadOnlyList<string>> GetARecordIps(string fullDomain)
+        {
+            var zone = await GetMatchingZoneAsync(fullDomain);
+            if (zone == null)
+            {
+                return Array.Empty<string>();
+            }
+
+            var records = await GetDnsRecordsAsync(zone.Id, "A", fullDomain);
+            return records
+                .Select(record => record.Content)
+                .Where(content => !string.IsNullOrWhiteSpace(content))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
         private async Task<ZoneInfo?> GetMatchingZoneAsync(string fullDomain)
         {
             var zones = await GetZonesAsync();
