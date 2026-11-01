@@ -38,6 +38,11 @@ namespace CloudflareFastCDN.Utils
                 var json = File.ReadAllText(PoolFile);
                 _seeds = JsonSerializer.Deserialize<List<SeedRecord>>(json) ?? new();
                 _seeds.Sort((a, b) => a.Score.CompareTo(b.Score));
+                if (_seeds.Count > MaxSeeds)
+                {
+                    Console.WriteLine($"种子库裁剪：{_seeds.Count} 个 → {MaxSeeds} 个（保留评分最优）");
+                    _seeds = _seeds.Take(MaxSeeds).ToList();
+                }
             }
             catch
             {
