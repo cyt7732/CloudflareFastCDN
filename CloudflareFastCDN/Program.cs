@@ -756,9 +756,10 @@ namespace CloudflareFastCDN
             }
             DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
 
-            // 1. 抽样：70% 网段加权 + 30% 全量随机
+            // 1. 抽样：50% 网段评分加权 + 50% 全量随机
+            //    加权那半偏向历史表现好的网段，随机那半作为评分偏差的保险
             var allIps = processor.LoadIPRanges();
-            var weightedCount = (int)Math.Round(AppConfig.MaxIps * 0.7);
+            var weightedCount = (int)Math.Round(AppConfig.MaxIps * 0.5);
             var rng = new Random();
             var weightedIps = subnetTable.SampleWeighted(weightedCount, rng);
             // 加权抽样不足时用全量随机补足，保证总数达到 MAX_IPS
@@ -767,6 +768,7 @@ namespace CloudflareFastCDN
             var sampledIps = weightedIps.Concat(randomIps).Distinct().ToList();
 
             Console.WriteLine($"抽样：{sampledIps.Count} 个（网段加权 {weightedIps.Count} + 全量随机 {randomIps.Count}）");
+            Console.WriteLine($"网段分数表：全量 {subnetTable.TotalSubnets} 个网段，已记录 {subnetTable.Count} 个");
             DashboardState.UpdateRun(run => run.Sampled = sampledIps.Count, $"TCP 快筛（{sampledIps.Count}个IP）");
 
             // 2. TCP 快筛
@@ -779,8 +781,24 @@ namespace CloudflareFastCDN
             Console.WriteLine($"TCP 快筛：{tcpPassed.Count}/{sampledIps.Count} 通过");
             DashboardState.UpdateRun(run => run.FirstRoundPassed = tcpPassed.Count);
 
+            // 记录 TCP 不通的网段。
+            // 每轮只有 TCP 前 10 能进 HTTP 验证，所以「失败」信号只能从这里拿，
+            // 否则 5900 多个网段永远停在默认分，加权抽样就等于纯随机。
+            var tcpPassedSet = new HashSet<IPAddress>(tcpPassed.Select(item => item.IP));
+            var tcpMissCount = 0;
+            foreach (var ip in sampledIps)
+            {
+                if (tcpPassedSet.Contains(ip))
+                    continue;
+                subnetTable.RecordMiss(ip);
+                tcpMissCount++;
+            }
+            if (tcpMissCount > 0)
+                Console.WriteLine($"网段分数表：记录 {tcpMissCount} 个 TCP 不通的网段");
+
             if (tcpPassed.Count == 0)
             {
+                subnetTable.Save();
                 Console.WriteLine("没有 IP 通过 TCP 快筛，跳过本轮");
                 return SelectionResult.Empty;
             }
@@ -803,6 +821,7 @@ namespace CloudflareFastCDN
             // 5. 全部做 HTTP 验证
             var httpPing = new Httping();
             var scored = new List<(IPAddress Ip, double Score, TimeSpan Delay)>();
+            var failedCandidates = new List<IPAddress>();
             var seedSet = new HashSet<IPAddress>(seedIps);
             int index = 0;
             foreach (var ip in candidates)
@@ -831,6 +850,7 @@ namespace CloudflareFastCDN
                 }
                 else
                 {
+                    failedCandidates.Add(ip);
                     Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.success}/{HttpProbeCount} 未通过：{FormatError(probe.error)}");
                 }
 
@@ -858,9 +878,15 @@ namespace CloudflareFastCDN
             }
 
             // 6. 排序
+            //    先记录失败的网段，避免「只学好的、学不会差的」
+            foreach (var ip in failedCandidates)
+            {
+                subnetTable.RecordMiss(ip);
+            }
             scored.Sort((a, b) => a.Score.CompareTo(b.Score));
             if (scored.Count == 0)
             {
+                subnetTable.Save();
                 Console.WriteLine("没有 IP 通过 HTTP 验证，本轮结束");
                 return SelectionResult.Empty;
             }
@@ -885,7 +911,7 @@ namespace CloudflareFastCDN
                 subnetTable.RecordHit(item.Ip, item.Score);
             }
             subnetTable.Save();
-            Console.WriteLine($"网段分数表：当前记录 {subnetTable.Count} 个网段");
+            Console.WriteLine($"网段分数表：已记录 {subnetTable.Count}/{subnetTable.TotalSubnets} 个网段（本轮失败 {failedCandidates.Count} 个）");
 
             // 9. 切换判定
             // 计算当前 IP 在本轮评分里的排名（1-based；0 表示本轮测试失败）
