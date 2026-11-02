@@ -3,12 +3,14 @@ using System.Text.Json;
 namespace CloudflareFastCDN.Utils
 {
     /// <summary>
-    /// 当前在用 IP 的切换状态，用于实现「不轻易换、挂了立刻换」的策略。
+    /// 当前在用 IP 的切换状态。
+    /// 判定规则：当前 IP 本轮排名 > 5 或测试失败 → 直接换；排名 ≤ 5 → 第 1 名需好 10% 以上才换。
+    /// 不设冷却期：每小时一轮，候选池里都是好 IP，换了也不会差。
     /// </summary>
     public class SwitchState
     {
-        private const double SwitchThresholdRatio = 0.85;   // 新 IP 必须好 15% 才换
-        private static readonly TimeSpan Cooldown = TimeSpan.FromHours(6);  // 切换后 6 小时冷却
+        private const double SwitchThresholdRatio = 0.90;   // 第 1 名需比当前好 10% 才换
+        private const int TopRankProtection = 5;            // 前 5 名受保护，不轻易换
         private const int FailoverThreshold = 3;            // 连续失败 3 次触发灾备
 
         private static readonly string StateFile =
@@ -52,44 +54,52 @@ namespace CloudflareFastCDN.Utils
         }
 
         /// <summary>
-        /// 判定是否应该切换到新 IP。
-        /// 返回 (是否切换, 原因)。
+        /// 任意检查点（补充检查、手动复检、首次预检）测出当前 IP 的新数据时调用，刷新基准。
         /// </summary>
-        public (bool ShouldSwitch, string Reason) Evaluate(string candidateIp, double candidateScore)
+        public void UpdateBaseline(double score, double delayMs)
         {
-            if (string.Equals(CurrentIp, candidateIp, StringComparison.OrdinalIgnoreCase))
-            {
-                return (false, "与当前 IP 相同");
-            }
+            CurrentScore = score;
+            CurrentDelayMs = delayMs;
+            Save();
+        }
 
+        /// <summary>
+        /// 判定是否切换到候选 IP（种子库第 1 名）。
+        /// </summary>
+        /// <param name="candidateIp">候选 IP</param>
+        /// <param name="candidateScore">候选评分</param>
+        /// <param name="currentRank">当前 IP 在本轮评分中的排名（1-based；0 表示本轮测试失败/不在列表里）</param>
+        public (bool ShouldSwitch, string Reason) Evaluate(string candidateIp, double candidateScore, int currentRank)
+        {
             if (string.IsNullOrEmpty(CurrentIp))
             {
                 return (true, "首次分配");
             }
 
-            // 灾备优先：当前 IP 已经连续失败
-            if (ConsecutiveFailures >= FailoverThreshold)
+            if (string.Equals(CurrentIp, candidateIp, StringComparison.OrdinalIgnoreCase))
             {
-                return (true, $"当前 IP 连续失败 {ConsecutiveFailures} 次，灾备切换");
+                return (false, "候选与当前相同");
             }
 
-            // 冷却期内不换
-            if (DateTime.TryParse(LastSwitchAt, out var lastSwitch))
+            // 当前 IP 本轮测试失败，不在 scored 列表里
+            if (currentRank <= 0)
             {
-                var elapsed = DateTime.Now - lastSwitch;
-                if (elapsed < Cooldown)
-                {
-                    return (false, $"冷却期内（距上次切换 {elapsed.TotalHours:0.0} 小时，需满 {Cooldown.TotalHours:0} 小时）");
-                }
+                return (true, "当前 IP 本轮测试失败，切换到种子库第 1 名");
             }
 
-            // 阈值：新 IP 必须显著更好
-            if (CurrentScore > 0 && candidateScore >= CurrentScore * SwitchThresholdRatio)
+            // 排名在前 5 之外：第 1 名必然分数更低，直接换
+            if (currentRank > TopRankProtection)
             {
-                return (false, $"提升不足（当前 {CurrentScore:0.00}，候选 {candidateScore:0.00}，需低于 {CurrentScore * SwitchThresholdRatio:0.00}）");
+                return (true, $"当前 IP 排名第 {currentRank}（前 5 之外），切换到第 1 名");
             }
 
-            return (true, $"显著更优（当前 {CurrentScore:0.00} → 候选 {candidateScore:0.00}）");
+            // 排名在前 5：第 1 名需好 10% 以上
+            if (CurrentScore > 0 && candidateScore < CurrentScore * SwitchThresholdRatio)
+            {
+                return (true, $"第 1 名显著更优（当前 {CurrentScore:0.00} → 候选 {candidateScore:0.00}，降幅超 10%）");
+            }
+
+            return (false, $"当前 IP 排名第 {currentRank}，第 1 名提升不足 10%（当前 {CurrentScore:0.00}，候选 {candidateScore:0.00}）");
         }
 
         public void MarkSwitched(string ip, double score, double delayMs = 0)
@@ -104,7 +114,6 @@ namespace CloudflareFastCDN.Utils
 
         /// <summary>
         /// 初始化基准（首次运行或状态文件丢失时，从当前 DNS 记录反推）。
-        /// 不设置冷却期，避免刚启动就误判。
         /// </summary>
         public void Initialize(string ip, double score, double delayMs = 0)
         {

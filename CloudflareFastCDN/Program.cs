@@ -331,6 +331,19 @@ namespace CloudflareFastCDN
 
             Console.WriteLine($"首次域名预检的{assignedIps.Count}个IPv4地址均正常，跳过首次全量优选");
             DashboardState.SetAssignedIps(assignedIps.Select(item => (item.Rank, item.IP.ToString(), item.BaselineDelay.TotalMilliseconds)));
+
+            // 首次预检成功时初始化切换基准
+            if (assignedIps.Count > 0)
+            {
+                var switchState = SwitchState.Load();
+                if (string.IsNullOrEmpty(switchState.CurrentIp))
+                {
+                    var first = assignedIps[0];
+                    switchState.Initialize(first.IP.ToString(), first.BaselineDelay.TotalMilliseconds, first.BaselineDelay.TotalMilliseconds);
+                    Console.WriteLine($"切换基准初始化：{first.IP} 延迟 {first.BaselineDelay.TotalMilliseconds:0.00}ms（首次预检）");
+                }
+            }
+
             return new SelectionResult(assignedIps);
         }
 
@@ -488,6 +501,13 @@ namespace CloudflareFastCDN
                     return false;
                 }
 
+                // 刷新切换基准（复检测出的真实延迟）
+                var switchState = SwitchState.Load();
+                if (string.Equals(switchState.CurrentIp, assignedIp.IP.ToString(), StringComparison.OrdinalIgnoreCase))
+                {
+                    switchState.UpdateBaseline(averageDelay.TotalMilliseconds, averageDelay.TotalMilliseconds);
+                }
+
                 if (averageDelay > TimeSpan.Zero && averageDelay < assignedIp.BaselineDelay)
                 {
                     Console.WriteLine($"已分配IP复检正常：Top{assignedIp.Rank} {assignedIp.IP} HTTP成功：{result.success}/{HttpProbeCount} 当前{averageDelay.TotalMilliseconds:0.00}ms，低于基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms，基线更新为当前值");
@@ -641,6 +661,12 @@ namespace CloudflareFastCDN
                 if (result.success)
                 {
                     Console.WriteLine($"补充HTTP检查 [{attempt}/{SupplementalHttpCheckCount}] 成功，HTTP延迟：{result.delay.TotalMilliseconds:0.00}ms");
+                    // 刷新切换基准（单次探测无 cv，用延迟近似评分）
+                    var switchState = SwitchState.Load();
+                    if (string.Equals(switchState.CurrentIp, selectedIp.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        switchState.UpdateBaseline(result.delay.TotalMilliseconds, result.delay.TotalMilliseconds);
+                    }
                     return true;
                 }
 
@@ -763,8 +789,13 @@ namespace CloudflareFastCDN
             var newCandidates = tcpPassed.Take(NewCandidateCount).Select(item => item.IP).ToList();
             Console.WriteLine($"新候选：{newCandidates.Count} 个（TCP 延迟最低）");
 
-            // 4. 候选 = 种子 + 新
+            // 4. 候选 = 种子 + 新 + 当前 IP（保证当前 IP 每轮都被测，不会脱管）
             var candidates = seedIps.Concat(newCandidates).Distinct().ToList();
+            if (IPAddress.TryParse(switchState.CurrentIp, out var currentCandidateIp) && !candidates.Contains(currentCandidateIp))
+            {
+                candidates.Add(currentCandidateIp);
+                Console.WriteLine($"当前 IP {currentCandidateIp} 不在种子库，已强制加入候选池");
+            }
             Console.WriteLine($"本轮候选：{candidates.Count} 个（种子 {seedIps.Count} + 新 {newCandidates.Count}）");
 
             DashboardState.UpdateRun(run => run.HttpCandidates = candidates.Count, $"HTTP 验证（{candidates.Count}个IP）");
@@ -857,7 +888,18 @@ namespace CloudflareFastCDN
             Console.WriteLine($"网段分数表：当前记录 {subnetTable.Count} 个网段");
 
             // 9. 切换判定
-            var (shouldSwitch, reason) = switchState.Evaluate(top.Ip.ToString(), top.Score);
+            // 计算当前 IP 在本轮评分里的排名（1-based；0 表示本轮测试失败）
+            var currentRank = 0;
+            if (IPAddress.TryParse(switchState.CurrentIp, out var rankedCurrentIp))
+            {
+                var rankedIndex = scored.FindIndex(item => item.Ip.Equals(rankedCurrentIp));
+                if (rankedIndex >= 0)
+                {
+                    currentRank = rankedIndex + 1;
+                }
+            }
+
+            var (shouldSwitch, reason) = switchState.Evaluate(top.Ip.ToString(), top.Score, currentRank);
             Console.WriteLine($"切换判定：{reason}");
             if (!shouldSwitch)
             {
