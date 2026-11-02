@@ -7,35 +7,48 @@ namespace CloudflareFastCDN.Utils
     public class SubnetScoreRecord
     {
         public string Subnet { get; set; } = string.Empty;
+
+        /// <summary>HTTP 验证出的最好评分（权威值，有它就优先用它）。</summary>
         public double BestScore { get; set; }
+
+        /// <summary>HTTP 验证通过次数。</summary>
         public int Hits { get; set; }
-        public int Failures { get; set; }
+
+        /// <summary>TCP 快筛粗分的运行平均。</summary>
+        public double TcpScore { get; set; }
+
+        /// <summary>TCP 粗测累计样本数。</summary>
+        public int TcpSamples { get; set; }
+
         public string LastSeen { get; set; } = string.Empty;
     }
 
     /// <summary>
     /// 网段分数表：给每个 /24 网段一个分数，抽样时按 1/分数^3 加权。
     ///
-    /// 分数规则（越低的网段越值得抽）：
-    ///   命中过（Hits &gt; 0）  → 该网段出过的最好评分
-    ///   只失败过（Failures &gt; 0）→ MissScore（900）
-    ///   从没抽到过        → DefaultScore（500）
+    /// 分数来源分两级：
+    ///   1. HTTP 验证过（Hits &gt; 0）→ 用该网段出过的最好评分，这是权威值
+    ///   2. 只有 TCP 粗测        → 用粗分的运行平均
+    ///   3. 从没抽到过           → DefaultScore（500）
     ///
-    /// 全量网段清单启动时从 ip.txt 展开（约 6000 个 /24），
-    /// 未记录的一律按 DefaultScore 处理，所以「探索」是自然发生的，不需要额外分支。
+    /// 粗分不是精确测量，只用来做方向性判断：本轮 1000 个抽样按延时排序，
+    /// 分位数线性映射到 [240, 900]，中位数正好等于 500。
+    /// 这样「未探索」和「中游网段」权重相当，缩圈是一轮一轮慢慢收的。
+    ///
+    /// 全量网段清单启动时从 ip.txt 展开（约 5955 个 /24）。
     /// </summary>
     public class SubnetScoreTable
     {
         /// <summary>从没抽到过的网段默认分。</summary>
         private const double DefaultScore = 500;
 
-        /// <summary>抽到过但 HTTP 验证全失败的网段分数（比默认分差）。</summary>
-        private const double MissScore = 900;
-
         /// <summary>权重 = 1 / 分数^ScorePower，指数越大越集中在好网段。</summary>
         private const int ScorePower = 3;
 
-        /// <summary>记录条数上限，仅防脏数据无限膨胀（全量网段约 6000）。</summary>
+        /// <summary>TCP 粗分运行平均的窗口：最多算最近 8 个样本，保证能跟着网络变化调整。</summary>
+        private const int TcpAverageWindow = 8;
+
+        /// <summary>记录条数上限，仅防脏数据无限膨胀（全量网段约 5955）。</summary>
         private const int MaxEntries = 12000;
 
         private static readonly string TableFile =
@@ -146,7 +159,7 @@ namespace CloudflareFastCDN.Utils
         }
 
         /// <summary>
-        /// 网段的当前分数：命中过取最好成绩，只失败过给 MissScore，没抽到过给 DefaultScore。
+        /// 网段的当前分数：有 HTTP 成绩用 HTTP 的，其次用 TCP 粗测平均，都没有给默认分。
         /// </summary>
         private double ScoreOf(string subnet)
         {
@@ -154,8 +167,8 @@ namespace CloudflareFastCDN.Utils
             {
                 if (record.Hits > 0 && record.BestScore > 0)
                     return record.BestScore;
-                if (record.Failures > 0)
-                    return MissScore;
+                if (record.TcpSamples > 0 && record.TcpScore > 0)
+                    return record.TcpScore;
             }
             return DefaultScore;
         }
@@ -192,30 +205,25 @@ namespace CloudflareFastCDN.Utils
         }
 
         /// <summary>
-        /// 记录一次失败：该网段抽到的 IP 没能通过 HTTP 验证。
-        /// 只加失败计数，不覆盖已有的好成绩。
+        /// 记录一次粗测样本（TCP 快筛延时换算的粗分，或 HTTP 验证失败记的差评）。
+        /// 做限定窗口的运行平均，单个样本的抖动不会把整段 /24 带偏。
         /// </summary>
-        public void RecordMiss(IPAddress ip)
+        public void RecordSample(IPAddress ip, double coarseScore)
         {
             var subnet = GetSubnet24(ip);
             if (subnet == null)
                 return;
 
-            if (_entries.TryGetValue(subnet, out var record))
+            if (!_entries.TryGetValue(subnet, out var record))
             {
-                record.Failures++;
-                record.LastSeen = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                record = new SubnetScoreRecord { Subnet = subnet };
+                _entries[subnet] = record;
             }
-            else
-            {
-                _entries[subnet] = new SubnetScoreRecord
-                {
-                    Subnet = subnet,
-                    Hits = 0,
-                    Failures = 1,
-                    LastSeen = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
-                };
-            }
+
+            var window = Math.Min(record.TcpSamples, TcpAverageWindow - 1);
+            record.TcpScore = (record.TcpScore * window + coarseScore) / (window + 1);
+            record.TcpSamples++;
+            record.LastSeen = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
             InvalidateWeights();
             TrimIfNeeded();
@@ -227,7 +235,9 @@ namespace CloudflareFastCDN.Utils
                 return;
 
             var worst = _entries.Values
-                .OrderByDescending(item => item.Hits > 0 ? item.BestScore : MissScore)
+                .OrderByDescending(item => item.Hits > 0 && item.BestScore > 0
+                    ? item.BestScore
+                    : item.TcpSamples > 0 && item.TcpScore > 0 ? item.TcpScore : DefaultScore)
                 .ThenBy(item => item.Hits)
                 .First();
             _entries.Remove(worst.Subnet);

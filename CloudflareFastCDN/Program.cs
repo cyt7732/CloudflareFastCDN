@@ -31,6 +31,12 @@ namespace CloudflareFastCDN
         private static readonly TimeSpan SupplementalHttpCheckInterval = TimeSpan.FromMinutes(5);
         private const int SupplementalHttpCheckCount = 3;
 
+        // 网段粗分：TCP 快筛的延时按本轮分位数映射到 [240, 900]，中位数正好 500
+        private const double TcpBestScore = 240;
+        private const double TcpMedianScore = 500;
+        private const double TcpWorstScore = 900;
+        private const double TcpLossPenalty = 300;  // 丢一个包（4 中 3）加 75 分
+
         private static List<DnsUpdateProvider>? _dnsUpdateProviders;
         private static int _dnsUpdateProvidersVersion = -1;
 
@@ -714,6 +720,17 @@ namespace CloudflareFastCDN
             return shuffledData.Take(sampleSize).ToList();
         }
 
+        /// <summary>
+        /// TCP 延时分位数 → 网段粗分。中位数正好映射到默认分 500，
+        /// 这样「未探索」和「中游网段」权重相当，缩圈不会一下子收得太狠。
+        /// </summary>
+        private static double TcpPercentileScore(double percentile)
+        {
+            if (percentile <= 0.5)
+                return TcpBestScore + (TcpMedianScore - TcpBestScore) * (percentile / 0.5);
+            return TcpMedianScore + (TcpWorstScore - TcpMedianScore) * ((percentile - 0.5) / 0.5);
+        }
+
         private static async Task<SelectionResult> SingleSelect(IReadOnlyList<DnsUpdateProvider> dnsUpdateProviders, string trigger)
         {
             RuntimeControl.ClearPending();
@@ -781,20 +798,41 @@ namespace CloudflareFastCDN
             Console.WriteLine($"TCP 快筛：{tcpPassed.Count}/{sampledIps.Count} 通过");
             DashboardState.UpdateRun(run => run.FirstRoundPassed = tcpPassed.Count);
 
-            // 记录 TCP 不通的网段。
-            // 每轮只有 TCP 前 10 能进 HTTP 验证，所以「失败」信号只能从这里拿，
-            // 否则 5900 多个网段永远停在默认分，加权抽样就等于纯随机。
-            var tcpPassedSet = new HashSet<IPAddress>(tcpPassed.Select(item => item.IP));
-            var tcpMissCount = 0;
-            foreach (var ip in sampledIps)
+            // 用本轮全部 TCP 样本给网段打粗分（不只取通过的）。
+            // 每轮只有前 10 能进 HTTP 验证，光靠 HTTP 成绩根本学不到网段好坏；
+            // TCP 延时虽然粗，但 1000 个样本足够做方向性判断，一轮一轮缩圈。
+            var tcpSampleCount = tcpResults.Count;
+            if (tcpSampleCount < sampledIps.Count * 0.1)
             {
-                if (tcpPassedSet.Contains(ip))
-                    continue;
-                subnetTable.RecordMiss(ip);
-                tcpMissCount++;
+                // 整体不通是网络异常，不是网段差，这时更新会把整张表毒掉
+                Console.WriteLine($"TCP 响应仅 {tcpSampleCount}/{sampledIps.Count}，疑似网络异常，本轮不更新网段分数表");
             }
-            if (tcpMissCount > 0)
-                Console.WriteLine($"网段分数表：记录 {tcpMissCount} 个 TCP 不通的网段");
+            else
+            {
+                var tcpScored = new HashSet<IPAddress>();
+                for (var i = 0; i < tcpSampleCount; i++)
+                {
+                    var item = tcpResults[i];
+                    var percentile = tcpSampleCount <= 1 ? 0.5d : (double)i / (tcpSampleCount - 1);
+                    var coarse = TcpPercentileScore(percentile);
+                    var lossRate = item.Sended > 0 ? 1d - (double)item.Received / item.Sended : 1d;
+                    coarse = Math.Min(TcpWorstScore, coarse + lossRate * TcpLossPenalty);
+                    subnetTable.RecordSample(item.IP, coarse);
+                    tcpScored.Add(item.IP);
+                }
+
+                // 一次都没连上的 IP 不进 tcpResults，按最差分记
+                var tcpDeadCount = 0;
+                foreach (var ip in sampledIps)
+                {
+                    if (tcpScored.Contains(ip))
+                        continue;
+                    subnetTable.RecordSample(ip, TcpWorstScore);
+                    tcpDeadCount++;
+                }
+
+                Console.WriteLine($"网段分数表：本轮记录 {tcpScored.Count} 个延时样本 + {tcpDeadCount} 个完全不通");
+            }
 
             if (tcpPassed.Count == 0)
             {
@@ -878,10 +916,10 @@ namespace CloudflareFastCDN
             }
 
             // 6. 排序
-            //    先记录失败的网段，避免「只学好的、学不会差的」
+            //    HTTP 验证失败的网段也记一笔差评（比 TCP 粗测更硬的证据）
             foreach (var ip in failedCandidates)
             {
-                subnetTable.RecordMiss(ip);
+                subnetTable.RecordSample(ip, TcpWorstScore);
             }
             scored.Sort((a, b) => a.Score.CompareTo(b.Score));
             if (scored.Count == 0)
