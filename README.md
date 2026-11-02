@@ -1,145 +1,209 @@
-# CloudflareFastCDN
+<div align="center">
 
-自动优选 Cloudflare CDN IP 并更新 DNS A 记录。支持 Cloudflare、腾讯云 DNSPod、阿里云解析。
+# CloudflareFastCDN · 增强版
 
-推荐阅读：[试试Cloudflare IP优选！让Cloudflare在国内再也不是减速器！](https://2x.nz/posts/cf-fastip/)
+**自动优选 Cloudflare CDN IP，持续更新 DNS A 记录**
 
-## 工作原理
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/cyt7732/CloudflareFastCDN/pkgs/container/cloudflarefastcdn)
+[![.NET](https://img.shields.io/badge/.NET-9.0-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Fork](https://img.shields.io/badge/Fork%20of-aiqinxuancai%2FCloudflareFastCDN-blue)](https://github.com/aiqinxuancai/CloudflareFastCDN)
 
-1. 首次启动解析已配置域名的当前 IPv4 地址并各做一次 HTTP 检查，全部正常时跳过首次全量优选
-2. 需要全量优选时，从 Cloudflare IPv4 网段按 `/24` 子网抽样
-3. 多轮 ICMP Ping 筛选低延迟候选 IP
-4. HTTP 连通性验证，可选带宽测速（带宽优先）
-5. 子网缓存（`subnet_cache.json`）加速历史优质节点复用
-6. 按排名依次更新 `*_DOMAINS` / `*_DOMAINS2` / `*_DOMAINS3` 的 A 记录
-7. 等待 `RUN_MINUTES` 后先复检已分配 IP；全部正常则跳过全量优选，否则进入下一轮全量优选；启用补充检查时，等待期间每 5 分钟验证一次当前最优 IP
+</div>
+
+---
+
+## 这是什么
+
+一个运行在 Docker 里的 Cloudflare 优选 IP 工具：**持续测试 IP → 按稳定性评分排序 → 自动更新 DNS A 记录**。
+
+支持 Cloudflare、腾讯云 DNSPod、阿里云解析。
+
+本项目是 [aiqinxuancai/CloudflareFastCDN](https://github.com/aiqinxuancai/CloudflareFastCDN) 的**深度改造版**——保留了它的 Docker 部署、Web 管理页和 DNS 商适配，但**筛选流程、评分系统、决策逻辑全部重写**。
+
+> 如果你只需要原版功能，请使用上游项目。
+
+## 为什么改造
+
+原版在实际使用中暴露了几个问题：
+
+| 问题 | 现象 | 后果 |
+|---|---|---|
+| **只看平均延迟** | 延迟 247ms 但一半请求超时的 IP 照样入选 | 用户一半概率转圈 |
+| **ICMP 筛选太严** | 4/4、5/5 全通才通过，CF 很多节点限 ICMP | 大量好 IP 被误杀 |
+| **种子库分数冻结** | 100 个种子，每轮只有 10 个能进 HTTP 验证 | 33 轮才能刷一遍，等于摆设 |
+| **当前 IP 脱管** | 被淘汰的 IP 不再参与测试 | 当前 IP 变差了也没人管 |
+| **见好就换** | 差 5% 也换，频繁横跳 | DNS 抖动 |
+| **故障恢复慢** | IP 挂了要跑 15 分钟全量优选 | 用户等 15 分钟 |
+
+## 改造后的机制
+
+### 筛选流程
+
+```
+每轮（默认 60 分钟）
+  │
+  ├─ 抽样 1000 个
+  │   ├─ 70% 网段加权（从历史高分 /24 网段抽）
+  │   └─ 30% 全量随机（探索新网段）
+  │
+  ├─ TCP 快筛（443 端口，4 次允许丢 1 次）
+  │
+  ├─ 候选 = 种子库 10 个 + TCP 延迟最低 10 个 + 当前 IP（如不在种子库）
+  │
+  ├─ 全部做 HTTP 验证（5 次探测，间隔 5~8 秒）
+  │   └─ 评分 = 平均延迟 × (1 + 变异系数) × (1 + 丢包率)
+  │
+  ├─ 前 10 名入库（种子库，容量 10，按评分淘汰）
+  │
+  ├─ 网段分数表记录（/24 网段的最高分与命中次数）
+  │
+  └─ 切换判定
+      ├─ 当前 IP 本轮测试失败        → 换
+      ├─ 当前 IP 排名 > 5            → 换
+      └─ 当前 IP 排名 ≤ 5            → 第 1 名需好 10% 以上才换
+```
+
+### 三种触发
+
+| 触发 | 频率 | 行为 |
+|---|---|---|
+| **定时优选** | `RUN_MINUTES`（默认 60 分钟） | 跑一轮完整优选（约 15 分钟） |
+| **心跳检查** | 5 分钟 | 检查当前 IP，连续 3 次失败触发灾备 |
+| **手动** | 随时 | 「立即优选」/「立即复检」 |
+
+### 灾备快速切换
+
+当前 IP 连续 3 次心跳失败（约 15 分钟）→ 从种子库快速测一遍 TCP → **10 秒内换到可用 IP**，不跑全量优选。
+
+### 稳定性评分
+
+```
+评分 = 平均延迟 × (1 + 变异系数) × (1 + 丢包率)
+
+变异系数 cv = 标准差 / 平均值
+```
+
+- 快且稳 → 评分 ≈ 延迟
+- 快但抖 → 被 cv 放大，可能翻倍
+- 慢又抖 → 评分最差
+
+**核心是「快」和「稳」两个都要**。一个 200ms 但 cv=1.0 的 IP（评分 400）会输给 350ms 但 cv=0.05 的 IP（评分 367）。
 
 ## 快速开始
 
 ### Docker Compose（推荐）
 
+```yaml
+services:
+  cloudflare-fast-cdn:
+    image: ghcr.io/cyt7732/cloudflarefastcdn:latest
+    container_name: cloudflare-fast-cdn
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    environment:
+      TZ: Asia/Shanghai
+      CLOUDFLARE_KEY: your_api_token
+      CLOUDFLARE_DOMAINS: your.domain.com
+      HTTP_PROBE_URL: https://your.domain.com/
+      WEB_USERNAME: admin
+      MAX_IPS: "1000"
+      PING_THREADS: "16"
+      RUN_MINUTES: "60"
+      ENABLE_SUPPLEMENTAL_HTTP_CHECK: "true"
+    volumes:
+      - ./data:/data
+```
+
 ```bash
-cp .env.example .env
 docker compose up -d
 ```
 
-启动后访问 `http://<主机IP>:19401/`，首次启动会自动进入「设置」页面，填写 DNS 服务商凭证和域名并保存后即开始优选。**请同时在设置页面中设置登录密码**。
+启动后访问 `http://<主机IP>:19401/`。
 
-默认拉取 `ghcr.io/aiqinxuancai/cloudflarefastcdn:latest`。可在 `.env` 中修改 `IMAGE_TAG` 固定版本；如果 GHCR 软件包为私有，请先执行 `docker login ghcr.io`。
+> **`cap_add: NET_RAW` 必须保留**，TCP 快筛和 ICMP 探测需要原始套接字权限。
 
-### Docker
+### 环境要求
 
-```bash
-docker run -d \
-  --name cloudflare-fast-cdn \
-  --restart unless-stopped \
-  --cap-add NET_RAW \
-  -e TZ=Asia/Shanghai \
-  -p 19401:19401 \
-  -v cloudflare-fast-cdn-data:/data \
-  ghcr.io/aiqinxuancai/cloudflarefastcdn:latest
-```
+- Docker（建议 `network_mode: host`，避免容器内 DNS 解析问题）
+- 一个 Cloudflare API Token（DNS 编辑权限）
+- 一个已接入 Cloudflare 的域名
 
-### 直接运行
+## 配置
 
-```bash
-CloudflareFastCDN
-```
+### 核心环境变量
 
-直接运行时管理页面默认只监听 `127.0.0.1`，需要从其他设备访问时使用 `--WEB_HOST=0.0.0.0` 启动。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CLOUDFLARE_KEY` | - | Cloudflare API Token（DNS 编辑权限） |
+| `CLOUDFLARE_DOMAINS` | - | 第 1 名 IP 更新的域名（逗号分隔多个） |
+| `CLOUDFLARE_DOMAINS2` | - | 第 2 名 IP 更新的域名 |
+| `CLOUDFLARE_DOMAINS3` | - | 第 3 名 IP 更新的域名 |
+| `HTTP_PROBE_URL` | `https://www.visa.cn/` | HTTP 验证地址，**建议用已开启 CF 代理的自有站点** |
+| `MAX_IPS` | 400 | 每轮抽样 IP 数（建议 1000） |
+| `PING_THREADS` | 8 | 并发线程数（建议 16） |
+| `RUN_MINUTES` | 60 | 优选周期（分钟） |
+| `ENABLE_SUPPLEMENTAL_HTTP_CHECK` | false | 开启每 5 分钟心跳检查 |
+| `UPDATE_IP_LIST` | false | 启动时更新 Cloudflare 官方 IP 段 |
 
-## Web 管理页面
+完整配置见 Web 管理页「设置」标签，或 `.env.example`。
 
-程序内置 Web 管理页面，默认监听 `19401` 端口：
+### 数据文件
 
-- **概览**：当前运行阶段、下次复检倒计时、已分配 IP 及其基线/最近延迟
-- **折线图**：已分配 IP 的 HTTP 延迟趋势和每轮优选的 Top1 延迟，支持 6 小时 / 24 小时 / 7 天 / 30 天 / 全部时间范围
-- **优选详情**：正在进行或最近一次优选的候选 IP 验证结果、DNS 更新结果，以及历史优选记录
-- **运行日志**：实时查看，支持关键字筛选
-- **立即优选**：立即执行一次全量优选并更新 DNS；当前处于复检或预检时会排队，在其完成后执行
-- **立即复检**：提前结束等待，立即复检已分配 IP，不通过时自动进入全量优选
-- **设置**：在页面中修改下方「运行设置」的全部项目
+所有状态存在 `/data` 目录（建议绑定挂载到宿主机）：
 
-设置保存在 `settings.json`（Docker 下为 `/data/settings.json`），保存后立即生效：周期、超时等参数从下一次检测开始使用；修改 DNS 服务商凭证或域名会自动安排一次全量优选；标注「重启后生效」的项目需重启程序。密钥类设置只写不读，页面上仅显示前几位。
+| 文件 | 内容 |
+|---|---|
+| `seed_pool.json` | 种子 IP 库（10 个精品 IP，每轮全测） |
+| `subnet_scores.json` | 网段分数表（`/24` 网段的最高分与命中次数） |
+| `switch_state.json` | 当前 IP、评分、连续失败次数 |
+| `subnet_cache.json` | 子网缓存（兼容保留，新流程不主动使用） |
+| `web_history.json` | 优选历史与延迟采样（Web 页面图表数据） |
+| `settings.json` | Web 页面保存的配置 |
 
-延迟历史与优选记录保存在 `web_history.json`（Docker 下为 `/data/web_history.json`），重启后保留。
+**`seed_pool.json` 和 `subnet_scores.json` 跑得越久越准**，建议纳入备份。
 
-设置登录密码后访问需要 HTTP Basic 认证，**暴露到局域网或公网时务必设置密码**；未设置密码时任何能访问该端口的人都可以查看和修改设置。
+## Web 管理页
 
-## 配置参数
+访问 `http://<主机IP>:19401/`：
 
-### 环境变量与锁定
+- **概览**：当前状态、下次检查倒计时、Top1 延迟、已完成轮数
+- **已分配 IP**：当前 DNS 指向的 IP、基线延迟、最近检查
+- **种子 IP 库**：10 个精品 IP 及其评分、延迟、最后命中时间
+- **延迟曲线**：已分配 IP 的 HTTP 延迟趋势
+- **最近一次优选**：本轮候选明细、评分、DNS 更新结果
+- **日志**：实时日志，支持关键字筛选
+- **设置**：全部配置项（部分需重启生效）
 
-下方所有「运行设置」都可以在 Web 页面中修改，也可以继续通过环境变量或命令行参数（`--KEY=VALUE`，仅非 Docker 环境）指定。取值优先级为：
+## 与上游的功能对比
 
-**环境变量 > 命令行参数 > Web 页面保存的设置 > 默认值**
+| 功能 | 上游 | 本版 |
+|---|---|---|
+| 延迟测速协议 | ICMP | **TCP 443** |
+| 丢包容忍 | 4/4、5/5 全通 | 3/4、4/5 |
+| 评分依据 | 平均延迟 | **延迟 × (1+cv) × (1+丢包率)** |
+| 候选构成 | 两轮 ICMP 前 7 + 子网缓存 3 | **种子 10 + 新抽 10 + 当前 IP** |
+| 种子库 | 100 个，分数冻结 | **10 个，每轮全测刷新** |
+| 网段加权 | 无（10 个网段缓存） | **全量网段记录 + 加权抽样** |
+| 切换策略 | 见好就换 | **排名制 + 10% 阈值** |
+| 当前 IP 保护 | 无 | **强制进候选池 + 对比** |
+| 故障恢复 | 全量优选（15 分钟） | **灾备快速切换（10 秒）** |
+| 心跳检查 | 可选 | **可选（建议开启）** |
 
-通过环境变量或命令行参数指定的项目会在 Web 页面中**锁定为只读**，适合需要由部署配置统一管理的场景。值为空的环境变量视为未设置。从旧版本升级时，原有 `.env` 中填写的项目会保持生效并被锁定；如需改为在页面中管理，删除或注释 `.env` 中对应的行后重建容器即可。
+## 已知限制
 
-### 启动参数
+- **物理天花板**：不备案意味着流量必须绕境外节点，国内冷启动延迟约 **450~550ms**，这是「免费方案」的极限
+- **上游同步**：改造幅度较大，上游更新无法直接 merge，需手动 cherry-pick
+- **单次探测噪声**：心跳检查是单次探测，偶发波动可能被误判（连续 3 次才触发灾备，有缓冲）
 
-以下参数只能通过环境变量或命令行参数设置，修改后需重启：
+## 致谢
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `WEB_PORT` | `19401` | Web 管理页面端口，`0` 表示关闭；关闭后只能通过环境变量配置，且缺少 DNS 配置时程序直接退出 |
-| `WEB_HOST` | Docker：`0.0.0.0`；直接运行：`127.0.0.1` | Web 管理页面监听地址 |
-| `TZ` | `Etc/UTC` | Docker 环境下用于决定日志输出时区，例如 `Asia/Shanghai` |
+- [aiqinxuancai/CloudflareFastCDN](https://github.com/aiqinxuancai/CloudflareFastCDN) — 本项目的基础
+- [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) — TCP 测速与丢包率思路
+- [Cloudflare](https://www.cloudflare.com/) — 免费 CDN
 
-### 运行设置 · DNS 服务商
+## License
 
-至少配置一组域名，只配置了域名的服务商才需要填写对应凭证。
-
-| 参数 | 说明 |
-| --- | --- |
-| `CLOUDFLARE_KEY` | Cloudflare API Token（需 DNS 编辑权限） |
-| `CLOUDFLARE_DOMAINS` / `DOMAINS2` / `DOMAINS3` | 第 1 / 2 / 3 名 IP 更新的域名（兼容旧变量 `DOMAINS` / `DOMAINS2` / `DOMAINS3`） |
-| `TENCENTCLOUD_SECRET_ID` / `SECRET_KEY` | 腾讯云 API 凭证 |
-| `TENCENTCLOUD_DOMAINS` / `DOMAINS2` / `DOMAINS3` | 第 1 / 2 / 3 名 IP 更新的域名 |
-| `ALIBABACLOUD_ACCESS_KEY_ID` / `ACCESS_KEY_SECRET` | 阿里云 API 凭证 |
-| `ALIBABACLOUD_DOMAINS` / `DOMAINS2` / `DOMAINS3` | 第 1 / 2 / 3 名 IP 更新的域名 |
-
-### 运行设置 · 通用
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `PING_THREADS` | `8` | Ping 并发线程数 |
-| `MAX_IPS` | `400` | 每轮最多抽样 IP 数 |
-| `PING_INTERVAL_MS` | `150` | 单次 Ping 间隔（毫秒） |
-| `HTTP_PROBE_URL` | `https://www.visa.cn/` | HTTP 验证地址，建议使用自己的站点，必须开CF代理（黄云） |
-| `HTTP_PROBE_HEADERS` | 空 | HTTP 验证和测速请求附加请求头，环境变量格式为 `Header-Name:Value;Another-Header:Value`，页面中每行一个 |
-| `HTTP_PROBE_TIMEOUT_MS` | `4000` | HTTP 验证超时（毫秒） |
-| `HTTP_SPEEDTEST_TIMEOUT_MS` | `10000` | 测速总超时（毫秒） |
-| `HTTP_SPEEDTEST_IDLE_TIMEOUT_MS` | `3000` | 测速读取空闲超时（毫秒） |
-| `RUN_MINUTES` | `60` | 每轮完成后等待分钟数 |
-| `BANDWIDTH_PRIORITY` | `false` | `true` 时启用带宽优选（下载 `/speedtest` 测速），失败自动回退延迟优选 |
-| `UPDATE_IP_LIST` | `false` | 启动时更新 Cloudflare 官方 IPv4 网段列表（重启后生效） |
-| `ENABLE_SUPPLEMENTAL_HTTP_CHECK` | `false` | 等待期间每 5 分钟补充验证当前最优 IP，连续 3 次失败则提前重新优选 |
-| `FORCE_INITIAL_FULL_SELECTION` | `false` | `true` 时跳过首次域名 IP 预检并强制执行全量优选（重启后生效） |
-| `WEB_USERNAME` | `admin` | Web 管理页面登录用户名 |
-| `WEB_PASSWORD` | 空 | Web 管理页面登录密码，留空则无需登录 |
-
-所有控制台日志都会携带标准时间戳，格式为 `yyyy-MM-dd HH:mm:ss.fff zzz`。
-
-HTTP 验证使用浏览器导航风格的 `GET` 请求，优先协商 HTTP/2 并在需要时回退到 HTTP/1.1。验证只读取响应头，不下载完整页面；收到 `HTTP 403 Forbidden (GET)` 或请求超时时会立即跳过当前节点，不再重试或触发退避等待。
-
-第二轮 ICMP 检查会选取本轮实际抽样 IP 数量的前 25%（向上取整），例如抽样 400 个时取 100 个，抽样 150 个时取 38 个。
-
-每轮等待结束后，程序会先按最终 HTTP 验证的节奏复检已成功分配到 DNS 的 IP。延迟失效阈值为 `max(300ms, 当前基线 × 2)`，因此 100ms 基线到 300ms、400ms 基线到 800ms 时都会触发全量优选；复检通过且当前延迟低于基线时，基线会下调为当前值并用于下一周期。HTTP 失败、错误码或超时也会触发全量优选。全部正常则继续等待下一周期。
-
-默认情况下，程序首次启动会解析所有已配置域名的 A 记录，对去重后的每个 IPv4 地址做一次 HTTP 检查，并以检查延迟作为后续周期复检的初始基线。只要域名解析失败、没有 IPv4 地址或任一地址检查失败，就立即进入全量优选；全部地址正常时不会改写 DNS，直接进入等待周期。设置 `FORCE_INITIAL_FULL_SELECTION=true` 可恢复首次启动必定全量优选的行为。
-
-`HTTP_PROBE_HEADERS` 可配合 Cloudflare 自定义规则放行探测请求，例如：
-
-```txt
-(http.request.uri.path eq "/cf-health.txt"
- and any(http.request.headers["x-cdn-probe-token"][*] eq "your_random_token"))
-```
-
-### 带宽测速说明
-
-启用 `BANDWIDTH_PRIORITY=true` 后，程序会访问 `HTTP_PROBE_URL` 同域下的 `/speedtest` 文件进行测速。建议准备一个 **≥ 4 MB** 的静态文件，测速失败时自动回退延迟优选。
-
-## 免责声明
-
-请仅在你拥有合法管理权限的账号和域名下使用，由此产生的任何后果由使用者自行承担。
+MIT

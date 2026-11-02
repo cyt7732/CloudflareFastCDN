@@ -1,6 +1,6 @@
 services:
   cloudflare-fast-cdn:
-    image: "${IMAGE_NAME:-ghcr.io/aiqinxuancai/cloudflarefastcdn}:${IMAGE_TAG:-latest}"
+    image: "${IMAGE_NAME:-ghcr.io/cyt7732/cloudflarefastcdn}:${IMAGE_TAG:-latest}"
     container_name: cloudflare-fast-cdn
     restart: unless-stopped
     env_file:
