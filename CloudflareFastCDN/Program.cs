@@ -907,7 +907,16 @@ namespace CloudflareFastCDN
                 // 返回当前 IP，避免外层误判「无可用IP」而立即重跑
                 if (IPAddress.TryParse(switchState.CurrentIp, out var keepIp))
                 {
-                    var keep = new AssignedIp(keepIp, TimeSpan.FromMilliseconds(switchState.CurrentDelayMs), 1);
+                    // 基线延迟缺失时，用当前 IP 本轮实测值兜底，避免显示 0ms
+                    var keepDelayMs = switchState.CurrentDelayMs;
+                    if (keepDelayMs <= 0)
+                    {
+                        var currentInScored = scored.FirstOrDefault(item => item.Ip.Equals(keepIp));
+                        keepDelayMs = currentInScored.Ip != null
+                            ? currentInScored.Delay.TotalMilliseconds
+                            : top.Delay.TotalMilliseconds;
+                    }
+                    var keep = new AssignedIp(keepIp, TimeSpan.FromMilliseconds(keepDelayMs), 1);
                     return new SelectionResult(new[] { keep });
                 }
                 return SelectionResult.Empty;
