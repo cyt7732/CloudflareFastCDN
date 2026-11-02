@@ -158,6 +158,11 @@ namespace CloudflareFastCDN.Web
                     {
                         assigned.BaselineMs = Round(baselineMs.Value);
                     }
+                    else if (assigned.BaselineMs <= 0 && delayMs.HasValue)
+                    {
+                        // 基线缺失（首次分配或旧数据）时，用本次测得的延迟补上，避免一直显示 0
+                        assigned.BaselineMs = Round(delayMs.Value);
+                    }
                 }
 
                 SaveHistory();
