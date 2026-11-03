@@ -108,6 +108,22 @@ namespace CloudflareFastCDN.Utils
         }
 
         /// <summary>
+        /// 直接移除某个 IP（例如冷启动抖动过大被淘汰）。
+        /// 不做连续失败计数——冷启动抖动是确定性问题，没必要再给它机会。
+        /// </summary>
+        public bool Remove(IPAddress ip)
+        {
+            var key = ip.ToString();
+            var removed = _seeds.RemoveAll(r => r.Ip == key);
+            if (removed > 0)
+            {
+                Console.WriteLine($"种子库剔除：{key}（冷启动抖动过大）");
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// 记录测试失败：连续失败达到阈值则移除。
         /// </summary>
         public bool RecordFailure(IPAddress ip)

@@ -1040,8 +1040,13 @@ namespace CloudflareFastCDN
                 }
                 else if (probe.Success >= HttpMinSuccessCount && stats.Valid)
                 {
-                    // HTTP 本身没问题，是冷启动关被刷下来
+                    // HTTP 本身没问题，是冷启动关被刷下来。种子库里也一并剔除，
+                    // 否则下一轮还会被当种子带进精测，白占一个位置。
                     failedCandidates.Add(ip);
+                    if (seedSet.Contains(ip))
+                    {
+                        seedPool.Remove(ip);
+                    }
                     Console.WriteLine($"最终结果 [{index}] {ip} HTTP 通过，但{failReason} → 淘汰");
                 }
                 else
