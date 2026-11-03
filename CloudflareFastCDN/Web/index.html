@@ -276,7 +276,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
     <h2>已分配 IP <span class="sub">DNS 记录当前指向的优选结果</span></h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>排名</th><th>IP</th><th class="num">基线延迟</th><th class="num">最近延迟</th><th>最近检查</th><th>状态</th><th>域名</th></tr></thead>
+        <thead><tr><th>排名</th><th>IP</th><th class="num">冷启动</th><th class="num">稳态延迟</th><th class="num">最近稳态</th><th>最近检查</th><th>状态</th><th>域名</th></tr></thead>
         <tbody id="assignedBody"></tbody>
       </table>
     </div>
@@ -590,7 +590,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
 
     const top1 = status.assignedIps.find((item) => item.rank === 1) || status.assignedIps[0];
     $('tileTop1').textContent = top1 ? fmtMs(top1.lastDelayMs ?? top1.baselineMs) : '—';
-    $('tileTop1Meta').textContent = top1 ? `${top1.ip} · 基线 ${fmtMs(top1.baselineMs)}` : '暂无已分配 IP';
+    $('tileTop1Meta').textContent = top1 ? `${top1.ip} · 冷启动 ${fmtMs(top1.coldMs)} · 稳态 ${fmtMs(top1.baselineMs)}` : '暂无已分配 IP';
 
     $('tileRuns').textContent = String(status.completedRuns);
     $('tileRunsMeta').textContent = status.lastRunFinishedAt
@@ -635,6 +635,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
       body.append(el('tr', null,
         el('td', null, rankKey(item.rank)),
         el('td', { class: 'mono', text: item.ip }),
+        el('td', { class: 'num', text: fmtMs(item.coldMs) }),
         el('td', { class: 'num', text: fmtMs(item.baselineMs) }),
         el('td', { class: 'num', text: fmtMs(item.lastDelayMs) }),
         el('td', { class: 'muted', text: item.lastCheckedAt ? fmtDateTime(item.lastCheckedAt) : '—' }),

@@ -111,7 +111,7 @@ namespace CloudflareFastCDN.Web
             }
         }
 
-        public static void SetAssignedIps(IEnumerable<(int Rank, string Ip, double BaselineMs)> assignedIps)
+        public static void SetAssignedIps(IEnumerable<(int Rank, string Ip, double BaselineMs, double ColdMs)> assignedIps)
         {
             lock (SyncRoot)
             {
@@ -123,6 +123,7 @@ namespace CloudflareFastCDN.Web
                         Rank = item.Rank,
                         Ip = item.Ip,
                         BaselineMs = Round(item.BaselineMs),
+                        ColdMs = item.ColdMs > 0 ? Round(item.ColdMs) : null,
                         LastDelayMs = Round(item.BaselineMs),
                         LastCheckedAt = now,
                         LastCheckOk = true
@@ -133,8 +134,9 @@ namespace CloudflareFastCDN.Web
 
         /// <summary>
         /// 记录一次 HTTP 延迟检查；delayMs 为 null 表示检查失败。
+        /// delayMs / baselineMs 都是**稳态**延时，coldMs 是冷启动延时（仅展示）。
         /// </summary>
-        public static void RecordCheck(int rank, string ip, double? delayMs, string source, double? baselineMs = null)
+        public static void RecordCheck(int rank, string ip, double? delayMs, string source, double? baselineMs = null, double? coldMs = null)
         {
             lock (SyncRoot)
             {
@@ -154,6 +156,10 @@ namespace CloudflareFastCDN.Web
                     assigned.LastDelayMs = Round(delayMs);
                     assigned.LastCheckedAt = now;
                     assigned.LastCheckOk = delayMs.HasValue;
+                    if (coldMs.HasValue && coldMs.Value > 0)
+                    {
+                        assigned.ColdMs = Round(coldMs.Value);
+                    }
                     if (baselineMs.HasValue)
                     {
                         assigned.BaselineMs = Round(baselineMs.Value);
@@ -242,7 +248,7 @@ namespace CloudflareFastCDN.Web
                     });
                 }
 
-                SetAssignedIps(run.Assigned.Select(item => (item.Rank, item.Ip, item.DelayMs)));
+                SetAssignedIps(run.Assigned.Select(item => (item.Rank, item.Ip, item.DelayMs, 0d)));
                 SaveHistory();
             }
         }
@@ -402,7 +408,13 @@ namespace CloudflareFastCDN.Web
     {
         public int Rank { get; set; }
         public string Ip { get; set; } = string.Empty;
+
+        /// <summary>稳态延时（热路径），排名依据。</summary>
         public double BaselineMs { get; set; }
+
+        /// <summary>冷启动延时（首次访问体验），不参与排名。</summary>
+        public double? ColdMs { get; set; }
+
         public double? LastDelayMs { get; set; }
         public DateTimeOffset? LastCheckedAt { get; set; }
         public bool LastCheckOk { get; set; }

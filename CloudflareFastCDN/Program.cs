@@ -316,17 +316,18 @@ namespace CloudflareFastCDN
             foreach (var resolvedIp in resolvedIps.Values)
             {
                 DashboardState.SetPhase(DashboardPhase.InitialCheck, $"HTTP检查 Top{resolvedIp.Rank} {resolvedIp.IP}");
-                var result = await httpPing.SinglePing(resolvedIp.IP, pauseAfterBackoff: false);
-                DashboardState.RecordCheck(resolvedIp.Rank, resolvedIp.IP.ToString(), result.success ? result.delay.TotalMilliseconds : null, "首次预检");
-                if (!result.success)
+                var probe = await httpPing.PingWithOutcome(resolvedIp.IP, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
+                var stats = ProbeScore.Compute(probe);
+                DashboardState.RecordCheck(resolvedIp.Rank, resolvedIp.IP.ToString(), stats.Valid ? stats.WarmMs : null, "首次预检", null, stats.ColdMs);
+                if (!stats.Valid || probe.Success < HttpMinSuccessCount)
                 {
                     hasFailure = true;
-                    Console.WriteLine($"首次域名预检失败：{resolvedIp.IP}（{string.Join(", ", resolvedIp.Domains)}），原因：{FormatError(result.error)}");
+                    Console.WriteLine($"首次域名预检失败：{resolvedIp.IP}（{string.Join(", ", resolvedIp.Domains)}），原因：{FormatError(probe.Error)}");
                     continue;
                 }
 
-                assignedIps.Add(new AssignedIp(resolvedIp.IP, result.delay, resolvedIp.Rank));
-                Console.WriteLine($"首次域名预检正常：Top{resolvedIp.Rank} {resolvedIp.IP}（{string.Join(", ", resolvedIp.Domains)}），HTTP延迟：{result.delay.TotalMilliseconds:0.00}ms");
+                assignedIps.Add(new AssignedIp(resolvedIp.IP, TimeSpan.FromMilliseconds(stats.WarmMs), resolvedIp.Rank, stats.Score, stats.ColdMs));
+                Console.WriteLine($"首次域名预检正常：Top{resolvedIp.Rank} {resolvedIp.IP}（{string.Join(", ", resolvedIp.Domains)}）冷启动 {stats.ColdMs:0.00}ms 稳态 {stats.WarmMs:0.00}ms → 评分 {stats.Score:0.00}");
             }
 
             if (hasFailure)
@@ -336,7 +337,7 @@ namespace CloudflareFastCDN
             }
 
             Console.WriteLine($"首次域名预检的{assignedIps.Count}个IPv4地址均正常，跳过首次全量优选");
-            DashboardState.SetAssignedIps(assignedIps.Select(item => (item.Rank, item.IP.ToString(), item.BaselineDelay.TotalMilliseconds)));
+            DashboardState.SetAssignedIps(assignedIps.Select(item => (item.Rank, item.IP.ToString(), item.BaselineDelay.TotalMilliseconds, item.ColdMs)));
 
             // 首次预检成功时初始化切换基准
             if (assignedIps.Count > 0)
@@ -345,8 +346,8 @@ namespace CloudflareFastCDN
                 if (string.IsNullOrEmpty(switchState.CurrentIp))
                 {
                     var first = assignedIps[0];
-                    switchState.Initialize(first.IP.ToString(), first.BaselineDelay.TotalMilliseconds, first.BaselineDelay.TotalMilliseconds);
-                    Console.WriteLine($"切换基准初始化：{first.IP} 延迟 {first.BaselineDelay.TotalMilliseconds:0.00}ms（首次预检）");
+                    switchState.Initialize(first.IP.ToString(), first.Score, first.BaselineDelay.TotalMilliseconds, first.ColdMs);
+                    Console.WriteLine($"切换基准初始化：{first.IP} 冷启动 {first.ColdMs:0.00}ms 稳态 {first.BaselineDelay.TotalMilliseconds:0.00}ms 评分 {first.Score:0.00}（首次预检）");
                 }
             }
 
@@ -479,49 +480,50 @@ namespace CloudflareFastCDN
             {
                 var assignedIp = assignedIps[i];
                 DashboardState.SetPhase(DashboardPhase.Revalidating, $"复检 Top{assignedIp.Rank} {assignedIp.IP}（{i + 1}/{assignedIps.Count}）");
-                var result = await httpPing.Ping(assignedIp.IP, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
-                var averageDelay = result.success > 0
-                    ? TimeSpan.FromMilliseconds(result.totalDelay.TotalMilliseconds / result.success)
-                    : TimeSpan.Zero;
+                var probe = await httpPing.PingWithOutcome(assignedIp.IP, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
+                var stats = ProbeScore.Compute(probe);
+                var warmDelay = TimeSpan.FromMilliseconds(stats.WarmMs);
 
-                var passed = result.success >= HttpProbeCount;
-                var updatedBaseline = passed && averageDelay > TimeSpan.Zero && averageDelay < assignedIp.BaselineDelay
-                    ? averageDelay
+                var passed = probe.Success >= HttpProbeCount && stats.Valid;
+                var updatedBaseline = passed && warmDelay > TimeSpan.Zero && warmDelay < assignedIp.BaselineDelay
+                    ? warmDelay
                     : assignedIp.BaselineDelay;
                 DashboardState.RecordCheck(
                     assignedIp.Rank,
                     assignedIp.IP.ToString(),
-                    passed ? averageDelay.TotalMilliseconds : null,
+                    passed ? stats.WarmMs : null,
                     manual ? "手动复检" : "定时复检",
-                    updatedBaseline.TotalMilliseconds);
+                    updatedBaseline.TotalMilliseconds,
+                    stats.ColdMs);
 
-                if (result.success < HttpProbeCount)
+                if (probe.Success < HttpProbeCount)
                 {
-                    Console.WriteLine($"已分配IP复检失败：Top{assignedIp.Rank} {assignedIp.IP} HTTP成功：{result.success}/{HttpProbeCount}，原因：{FormatError(result.error)}，开始全量优选");
+                    Console.WriteLine($"已分配IP复检失败：Top{assignedIp.Rank} {assignedIp.IP} HTTP成功：{probe.Success}/{HttpProbeCount}，原因：{FormatError(probe.Error)}，开始全量优选");
                     return false;
                 }
 
-                if (IsAssignedDelayInvalid(assignedIp.BaselineDelay, averageDelay))
+                if (IsAssignedDelayInvalid(assignedIp.BaselineDelay, warmDelay))
                 {
-                    Console.WriteLine($"已分配IP复检延迟异常：Top{assignedIp.Rank} {assignedIp.IP} 当前{averageDelay.TotalMilliseconds:0.00}ms，基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms，开始全量优选");
+                    Console.WriteLine($"已分配IP复检延迟异常：Top{assignedIp.Rank} {assignedIp.IP} 稳态{warmDelay.TotalMilliseconds:0.00}ms，基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms，开始全量优选");
                     return false;
                 }
 
-                // 刷新切换基准（复检测出的真实延迟）
+                // 刷新切换基准：必须写 ProbeScore 口径的评分，不能写原始延时
                 var switchState = SwitchState.Load();
                 if (string.Equals(switchState.CurrentIp, assignedIp.IP.ToString(), StringComparison.OrdinalIgnoreCase))
                 {
-                    switchState.UpdateBaseline(averageDelay.TotalMilliseconds, averageDelay.TotalMilliseconds);
+                    switchState.UpdateBaseline(stats.Score, stats.WarmMs, stats.ColdMs);
                 }
 
-                if (averageDelay > TimeSpan.Zero && averageDelay < assignedIp.BaselineDelay)
+                if (stats.WarmMs > 0 && warmDelay < assignedIp.BaselineDelay)
                 {
-                    Console.WriteLine($"已分配IP复检正常：Top{assignedIp.Rank} {assignedIp.IP} HTTP成功：{result.success}/{HttpProbeCount} 当前{averageDelay.TotalMilliseconds:0.00}ms，低于基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms，基线更新为当前值");
-                    assignedIp.BaselineDelay = averageDelay;
+                    Console.WriteLine($"已分配IP复检正常：Top{assignedIp.Rank} {assignedIp.IP} 成功{probe.Success}/{HttpProbeCount} 冷启动{stats.ColdMs:0.00}ms 稳态{stats.WarmMs:0.00}ms（低于基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms，基线更新）→ 评分 {stats.Score:0.00}");
+                    assignedIp.BaselineDelay = warmDelay;
+                    assignedIp.ColdMs = stats.ColdMs;
                 }
                 else
                 {
-                    Console.WriteLine($"已分配IP复检正常：Top{assignedIp.Rank} {assignedIp.IP} HTTP成功：{result.success}/{HttpProbeCount} 当前{averageDelay.TotalMilliseconds:0.00}ms，基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms");
+                    Console.WriteLine($"已分配IP复检正常：Top{assignedIp.Rank} {assignedIp.IP} 成功{probe.Success}/{HttpProbeCount} 冷启动{stats.ColdMs:0.00}ms 稳态{stats.WarmMs:0.00}ms 基线{assignedIp.BaselineDelay.TotalMilliseconds:0.00}ms → 评分 {stats.Score:0.00}");
                 }
 
                 if (i < assignedIps.Count - 1)
@@ -564,22 +566,19 @@ namespace CloudflareFastCDN
                         }
 
                         var probe = await httpPing.PingWithOutcome(ip, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
-                        if (probe.success < HttpMinSuccessCount)
+                        if (probe.Success < HttpMinSuccessCount)
                         {
                             continue;
                         }
 
-                        var avg = TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success);
-                        var cv = 0d;
-                        if (probe.delays.Count > 1 && avg.TotalMilliseconds > 0)
+                        var result = ProbeScore.Compute(probe);
+                        if (!result.Valid)
                         {
-                            var mean = avg.TotalMilliseconds;
-                            var variance = probe.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
-                            cv = Math.Sqrt(variance) / mean;
+                            continue;
                         }
-                        var lossRate = 1d - (double)probe.success / HttpProbeCount;
-                        var score = avg.TotalMilliseconds * (1 + cv) * (1 + lossRate);
-                        return (ip.ToString(), score, avg.TotalMilliseconds);
+
+                        Console.WriteLine($"DNS 基准反推 {ip} 冷启动 {result.ColdMs:0.00}ms 稳态 {result.WarmMs:0.00}ms → 评分 {result.Score:0.00}");
+                        return (ip.ToString(), result.Score, result.WarmMs);
                     }
                 }
             }
@@ -643,6 +642,9 @@ namespace CloudflareFastCDN
             }
 
             var switchState = SwitchState.Load();
+            // 灾备只做了 TCP 快筛，没有 HTTP 评分，所以评分记 0：
+            // 下一轮全量优选会把这个 IP 强制拉进候选池重测，届时基准自动补上。
+            // 评分 <= 0 时 Evaluate 会跳过「显著更优」分支，只按排名兜底，不会误判。
             switchState.MarkSwitched(best.IP.ToString(), 0, best.Delay.TotalMilliseconds);
             switchState.Save();
 
@@ -657,26 +659,34 @@ namespace CloudflareFastCDN
         private static async Task<bool> RunSupplementalHttpCheck(AssignedIp assignedIp)
         {
             var selectedIp = assignedIp.IP;
-            Console.WriteLine($"补充HTTP检查：{selectedIp}，最多{SupplementalHttpCheckCount}次，任意一次成功即通过");
+            Console.WriteLine($"补充HTTP检查：{selectedIp}，最多{SupplementalHttpCheckCount}轮，每轮{HttpProbeCount}次探测（与选优同一口径）");
 
             var httpPing = new Httping();
             for (int attempt = 1; attempt <= SupplementalHttpCheckCount; attempt++)
             {
-                var result = await httpPing.SinglePing(selectedIp);
-                DashboardState.RecordCheck(assignedIp.Rank, selectedIp.ToString(), result.success ? result.delay.TotalMilliseconds : null, "补充检查");
-                if (result.success)
+                var probe = await httpPing.PingWithOutcome(selectedIp, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
+                var stats = ProbeScore.Compute(probe);
+                var passed = !probe.SkipNode && probe.Success >= HttpMinSuccessCount && stats.Valid;
+
+                DashboardState.RecordCheck(assignedIp.Rank, selectedIp.ToString(), passed ? stats.WarmMs : null, "补充检查", null, stats.ColdMs);
+
+                if (passed)
                 {
-                    Console.WriteLine($"补充HTTP检查 [{attempt}/{SupplementalHttpCheckCount}] 成功，HTTP延迟：{result.delay.TotalMilliseconds:0.00}ms");
-                    // 刷新切换基准（单次探测无 cv，用延迟近似评分）
+                    Console.WriteLine($"补充HTTP检查 [{attempt}/{SupplementalHttpCheckCount}] 通过 {probe.Success}/{HttpProbeCount} 冷启动 {stats.ColdMs:0.00}ms 稳态 {stats.WarmMs:0.00}ms → 评分 {stats.Score:0.00}");
+
+                    // 刷新切换基准：与选优同一口径，分数永远可比
                     var switchState = SwitchState.Load();
                     if (string.Equals(switchState.CurrentIp, selectedIp.ToString(), StringComparison.OrdinalIgnoreCase))
                     {
-                        switchState.UpdateBaseline(result.delay.TotalMilliseconds, result.delay.TotalMilliseconds);
+                        switchState.UpdateBaseline(stats.Score, stats.WarmMs, stats.ColdMs);
                     }
+
+                    assignedIp.BaselineDelay = TimeSpan.FromMilliseconds(stats.WarmMs);
+                    assignedIp.ColdMs = stats.ColdMs;
                     return true;
                 }
 
-                Console.WriteLine($"补充HTTP检查 [{attempt}/{SupplementalHttpCheckCount}] 失败：{FormatError(result.error)}");
+                Console.WriteLine($"补充HTTP检查 [{attempt}/{SupplementalHttpCheckCount}] 失败 {probe.Success}/{HttpProbeCount}：{FormatError(probe.Error)}");
             }
 
             return false;
@@ -858,7 +868,7 @@ namespace CloudflareFastCDN
 
             // 5. 全部做 HTTP 验证
             var httpPing = new Httping();
-            var scored = new List<(IPAddress Ip, double Score, TimeSpan Delay)>();
+            var scored = new List<(IPAddress Ip, double Score, TimeSpan Delay, double ColdMs)>();
             var failedCandidates = new List<IPAddress>();
             var seedSet = new HashSet<IPAddress>(seedIps);
             int index = 0;
@@ -867,29 +877,21 @@ namespace CloudflareFastCDN
                 index++;
                 DashboardState.SetSelectionDetail($"HTTP验证 {index}/{candidates.Count} {ip}");
                 var probe = await httpPing.PingWithOutcome(ip, HttpProbeCount, FinalProbeMinInterval, FinalProbeMaxInterval);
-                var avg = probe.success > 0
-                    ? TimeSpan.FromMilliseconds(probe.totalDelay.TotalMilliseconds / probe.success)
-                    : TimeSpan.Zero;
+                var stats = ProbeScore.Compute(probe);
 
-                var passed = !probe.skipNode && probe.success >= HttpMinSuccessCount;
+                var passed = !probe.SkipNode && probe.Success >= HttpMinSuccessCount && stats.Valid;
                 if (passed)
                 {
-                    var cv = 0d;
-                    if (probe.delays.Count > 1 && avg.TotalMilliseconds > 0)
-                    {
-                        var mean = avg.TotalMilliseconds;
-                        var variance = probe.delays.Average(d => Math.Pow(d.TotalMilliseconds - mean, 2));
-                        cv = Math.Sqrt(variance) / mean;
-                    }
-                    var lossRate = 1d - (double)probe.success / HttpProbeCount;
-                    var score = avg.TotalMilliseconds * (1 + cv) * (1 + lossRate);
-                    scored.Add((ip, score, avg));
-                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.success}/{HttpProbeCount} 均延时 {avg.TotalMilliseconds:0.00}ms → 评分 {score:0.00}（cv {cv:0.00}，丢包 {lossRate:P0}）");
+                    scored.Add((ip, stats.Score, TimeSpan.FromMilliseconds(stats.WarmMs), stats.ColdMs));
+                    Console.WriteLine(
+                        $"最终结果 [{index}] {ip} 成功 {probe.Success}/{HttpProbeCount} " +
+                        $"冷启动 {stats.ColdMs:0.00}ms 稳态 {stats.WarmMs:0.00}ms → 评分 {stats.Score:0.00}" +
+                        $"（稳态cv {stats.CvWarm:0.00}，丢包 {stats.LossRate:P0}）");
                 }
                 else
                 {
                     failedCandidates.Add(ip);
-                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.success}/{HttpProbeCount} 未通过：{FormatError(probe.error)}");
+                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.Success}/{HttpProbeCount} 未通过：{FormatError(probe.Error)}");
                 }
 
                 DashboardState.UpdateRun(run =>
@@ -898,11 +900,11 @@ namespace CloudflareFastCDN
                     {
                         Ip = ip.ToString(),
                         Source = seedSet.Contains(ip) ? "种子" : "新抽",
-                        HttpSuccess = probe.success,
+                        HttpSuccess = probe.Success,
                         HttpTotal = HttpProbeCount,
-                        HttpAvgMs = probe.success > 0 ? Math.Round(avg.TotalMilliseconds, 2) : null,
+                        HttpAvgMs = stats.Valid ? Math.Round(stats.WarmMs, 2) : null,
                         Passed = passed,
-                        Error = passed ? null : FormatError(probe.error)
+                        Error = passed ? null : FormatError(probe.Error)
                     });
                     run.HttpPassed = scored.Count;
                 });
@@ -930,7 +932,7 @@ namespace CloudflareFastCDN
             }
 
             var top = scored[0];
-            Console.WriteLine($"本轮最优：{top.Ip} 评分 {top.Score:0.00}（延迟 {top.Delay.TotalMilliseconds:0.00}ms）");
+            Console.WriteLine($"本轮最优：{top.Ip} 评分 {top.Score:0.00}（冷启动 {top.ColdMs:0.00}ms 稳态 {top.Delay.TotalMilliseconds:0.00}ms）");
 
             // 7. 更新种子库（前 N 名）
             var seedCount = Math.Min(scored.Count, SeedPoolCapacity);
@@ -963,7 +965,7 @@ namespace CloudflareFastCDN
                 }
             }
 
-            var (shouldSwitch, reason) = switchState.Evaluate(top.Ip.ToString(), top.Score, currentRank);
+            var (shouldSwitch, reason) = switchState.Evaluate(top.Ip.ToString(), top.Score, currentRank, scored.Count);
             Console.WriteLine($"切换判定：{reason}");
             if (!shouldSwitch)
             {
@@ -971,23 +973,27 @@ namespace CloudflareFastCDN
                 // 返回当前 IP，避免外层误判「无可用IP」而立即重跑
                 if (IPAddress.TryParse(switchState.CurrentIp, out var keepIp))
                 {
-                    // 基线延迟缺失时，用当前 IP 本轮实测值兜底，避免显示 0ms
-                    var keepDelayMs = switchState.CurrentDelayMs;
-                    if (keepDelayMs <= 0)
+                    var currentInScored = scored.FirstOrDefault(item => item.Ip.Equals(keepIp));
+                    var measured = currentInScored.Ip != null;
+
+                    var keepDelayMs = measured ? currentInScored.Delay.TotalMilliseconds : switchState.CurrentDelayMs;
+                    var keepColdMs = measured ? currentInScored.ColdMs : switchState.CurrentColdMs;
+                    var keepScore = measured ? currentInScored.Score : switchState.CurrentScore;
+
+                    // 用本轮实测值刷新基准，保证下一轮比较仍是同一口径（否则会一直用上任时的旧分）
+                    if (measured)
                     {
-                        var currentInScored = scored.FirstOrDefault(item => item.Ip.Equals(keepIp));
-                        keepDelayMs = currentInScored.Ip != null
-                            ? currentInScored.Delay.TotalMilliseconds
-                            : top.Delay.TotalMilliseconds;
+                        switchState.UpdateBaseline(keepScore, keepDelayMs, keepColdMs);
                     }
-                    var keep = new AssignedIp(keepIp, TimeSpan.FromMilliseconds(keepDelayMs), 1);
+
+                    var keep = new AssignedIp(keepIp, TimeSpan.FromMilliseconds(keepDelayMs), 1, keepScore, keepColdMs);
                     return new SelectionResult(new[] { keep });
                 }
                 return SelectionResult.Empty;
             }
 
             // 10. 更新 DNS
-            var assignedIpsByRank = new Dictionary<int, PingData>();
+            var assignedIpsByRank = new Dictionary<int, AssignedIp>();
             foreach (var provider in dnsUpdateProviders)
             {
                 foreach (var domain in provider.GetDomains(0))
@@ -999,7 +1005,7 @@ namespace CloudflareFastCDN
                         updated = await provider.Manager.AddOrUpdateARecord(domain, top.Ip.ToString());
                         if (updated)
                         {
-                            assignedIpsByRank.TryAdd(0, new PingData { IP = top.Ip, Delay = top.Delay });
+                            assignedIpsByRank.TryAdd(0, new AssignedIp(top.Ip, top.Delay, 1, top.Score, top.ColdMs));
                             Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
                         }
                     }
@@ -1021,17 +1027,17 @@ namespace CloudflareFastCDN
 
             if (assignedIpsByRank.Count > 0)
             {
-                switchState.MarkSwitched(top.Ip.ToString(), top.Score, top.Delay.TotalMilliseconds);
+                switchState.MarkSwitched(top.Ip.ToString(), top.Score, top.Delay.TotalMilliseconds, top.ColdMs);
             }
 
             var assignedIps = assignedIpsByRank
                 .OrderBy(item => item.Key)
-                .Select(item => new AssignedIp(item.Value.IP, item.Value.Delay, item.Key + 1))
+                .Select(item => item.Value)
                 .ToList();
 
             if (assignedIps.Count > 0)
             {
-                Console.WriteLine($"本轮实际分配IP：{string.Join(", ", assignedIps.Select(item => $"Top{item.Rank} {item.IP}({item.BaselineDelay.TotalMilliseconds:0.00}ms)"))}");
+                Console.WriteLine($"本轮实际分配IP：{string.Join(", ", assignedIps.Select(item => $"Top{item.Rank} {item.IP}(冷启动{item.ColdMs:0.00}ms 稳态{item.BaselineDelay.TotalMilliseconds:0.00}ms 评分{item.Score:0.00})"))}");
             }
             else
             {
@@ -1066,16 +1072,27 @@ namespace CloudflareFastCDN
 
         private sealed class AssignedIp
         {
-            public AssignedIp(IPAddress ip, TimeSpan baselineDelay, int rank)
+            public AssignedIp(IPAddress ip, TimeSpan baselineDelay, int rank, double score = 0, double coldMs = 0)
             {
                 IP = ip;
                 BaselineDelay = baselineDelay;
                 Rank = rank;
+                Score = score;
+                ColdMs = coldMs;
             }
 
             public IPAddress IP { get; }
+
+            /// <summary>稳态延时（热路径）。</summary>
             public TimeSpan BaselineDelay { get; set; }
+
             public int Rank { get; }
+
+            /// <summary>ProbeScore 口径的评分。</summary>
+            public double Score { get; }
+
+            /// <summary>冷启动延时（首次访问）。</summary>
+            public double ColdMs { get; set; }
         }
 
         private static string FormatError(string? error)

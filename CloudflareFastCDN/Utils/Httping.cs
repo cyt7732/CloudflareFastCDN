@@ -16,18 +16,25 @@ namespace CloudflareFastCDN.Utils
         public async Task<(int success, TimeSpan totalDelay, string error)> Ping(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null)
         {
             var result = await PingWithOutcome(ip, pingCount, minInterval, maxInterval);
-            return (result.success, result.totalDelay, result.error);
+            var total = result.WarmMs.Sum() + (result.ColdSucceeded ? result.ColdMs : 0);
+            return (result.Success, TimeSpan.FromMilliseconds(total), result.Error);
         }
 
-        internal async Task<(int success, TimeSpan totalDelay, string error, bool skipNode, List<TimeSpan> delays)> PingWithOutcome(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null)
+        /// <summary>
+        /// 连续探测同一个 IP。
+        /// 第 1 次是冷启动（新建 TCP + TLS 握手），第 2 次起走连接复用 ——
+        /// 两者必须分开统计，不能平均，原因见 ProbeStats 的注释。
+        /// </summary>
+        internal async Task<ProbeStats> PingWithOutcome(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null)
         {
             var probeTimeout = TimeSpan.FromMilliseconds(AppConfig.HttpProbeTimeoutMs);
             using var client = CreateClient(ip, probeTimeout);
 
             int success = 0;
-            TimeSpan totalDelay = TimeSpan.Zero;
             string lastError = string.Empty;
-            var delays = new List<TimeSpan>();
+            var coldMs = 0d;
+            var coldSucceeded = false;
+            var warmMs = new List<double>();
 
             for (int i = 0; i < pingCount; i++)
             {
@@ -35,8 +42,15 @@ namespace CloudflareFastCDN.Utils
                 if (pingResult.success)
                 {
                     success++;
-                    totalDelay += pingResult.delay;
-                    delays.Add(pingResult.delay);
+                    if (i == 0)
+                    {
+                        coldMs = pingResult.delay.TotalMilliseconds;
+                        coldSucceeded = true;
+                    }
+                    else
+                    {
+                        warmMs.Add(pingResult.delay.TotalMilliseconds);
+                    }
                 }
                 else
                 {
@@ -45,7 +59,16 @@ namespace CloudflareFastCDN.Utils
 
                 if (pingResult.skipNode)
                 {
-                    return (success, totalDelay, lastError, true, delays);
+                    return new ProbeStats
+                    {
+                        Success = success,
+                        Total = pingCount,
+                        ColdSucceeded = coldSucceeded,
+                        ColdMs = coldMs,
+                        WarmMs = warmMs,
+                        Error = lastError,
+                        SkipNode = true
+                    };
                 }
 
                 if (pingResult.shouldBackoff)
@@ -62,7 +85,16 @@ namespace CloudflareFastCDN.Utils
                 }
             }
 
-            return (success, totalDelay, lastError, false, delays);
+            return new ProbeStats
+            {
+                Success = success,
+                Total = pingCount,
+                ColdSucceeded = coldSucceeded,
+                ColdMs = coldMs,
+                WarmMs = warmMs,
+                Error = lastError,
+                SkipNode = false
+            };
         }
 
         public async Task<(bool success, TimeSpan delay, string error)> SinglePing(IPAddress ip, bool pauseAfterBackoff = true)
