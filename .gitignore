@@ -370,3 +370,6 @@ FodyWeavers.xsd
 
 # 本地助手记忆与工作记录
 .deepseek-harness/
+
+# 临时解压/分析目录
+.tmp-session/

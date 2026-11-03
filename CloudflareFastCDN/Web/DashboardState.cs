@@ -441,6 +441,13 @@ namespace CloudflareFastCDN.Web
         public int SecondRoundPassed { get; set; }
         public int CachedSampled { get; set; }
         public int CachedPassed { get; set; }
+
+        /// <summary>并发粗筛的候选数（TCP 延迟最低的一批）。</summary>
+        public int CoarseCandidates { get; set; }
+
+        /// <summary>粗筛通过、进入串行精测筛选范围的候选数。</summary>
+        public int CoarsePassed { get; set; }
+
         public int HttpCandidates { get; set; }
         public int HttpPassed { get; set; }
         public List<CandidateResult> Candidates { get; set; } = new();

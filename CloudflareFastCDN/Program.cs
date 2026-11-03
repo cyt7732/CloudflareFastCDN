@@ -968,7 +968,12 @@ namespace CloudflareFastCDN
             }
             Console.WriteLine($"本轮精测：{candidates.Count} 个（种子 {seedRefineIps.Count} + 粗筛 {refineIps.Count} + 当前IP）");
 
-            DashboardState.UpdateRun(run => run.HttpCandidates = candidates.Count, $"HTTP 精测（{candidates.Count}个IP）");
+            DashboardState.UpdateRun(run =>
+            {
+                run.CoarseCandidates = coarseCandidates.Count;
+                run.CoarsePassed = coarsePassed.Count;
+                run.HttpCandidates = candidates.Count;
+            }, $"HTTP 精测（{candidates.Count}个IP）");
 
             // 6. 串行精测
             var scored = new List<(IPAddress Ip, double Score, TimeSpan Delay, double ColdMs)>();

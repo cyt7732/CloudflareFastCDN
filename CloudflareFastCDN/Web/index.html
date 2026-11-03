@@ -238,7 +238,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
   <span id="conn" class="conn"></span>
   <span class="spacer"></span>
   <button id="btnRevalidate" type="button" title="立即检查当前 IP 是否健康（不等 5 分钟周期）；不通过时自动进入灾备或全量优选">立即复检</button>
-  <button id="btnSelect" type="button" class="primary" title="立即执行一轮完整优选（约15分钟）：20个候选全测，按切换策略（需好15%以上且不在冷却期）决定是否换 IP">立即优选</button>
+  <button id="btnSelect" type="button" class="primary" title="立即执行一轮完整优选（约10分钟）：TCP 快筛后并发粗筛 60 个候选、串行精测约 12 个，按切换策略决定是否换 IP">立即优选</button>
 </header>
 
 <main>
@@ -333,7 +333,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
     <h2>优选历史 <span class="sub">最近 50 次</span></h2>
     <div class="table-wrap scroll">
       <table>
-        <thead><tr><th>完成时间</th><th>触发原因</th><th>模式</th><th class="num">耗时</th><th class="num">抽样</th><th class="num">第1轮</th><th class="num">第2轮</th><th class="num">HTTP 通过</th><th>结果</th></tr></thead>
+        <thead><tr><th>完成时间</th><th>触发原因</th><th>模式</th><th class="num">耗时</th><th class="num">抽样</th><th class="num">第1轮</th><th class="num">第2轮</th><th class="num">粗筛</th><th class="num">HTTP 通过</th><th>结果</th></tr></thead>
         <tbody id="runsBody"></tbody>
       </table>
     </div>
@@ -1025,7 +1025,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
     body.replaceChildren();
     const runs = (state.history ? state.history.runs : []).slice(-50).reverse();
     if (runs.length === 0) {
-      body.append(el('tr', null, el('td', { colspan: '9', class: 'empty', text: '暂无优选记录' })));
+      body.append(el('tr', null, el('td', { colspan: '10', class: 'empty', text: '暂无优选记录' })));
       return;
     }
     for (const run of runs) {
@@ -1042,6 +1042,7 @@ details summary { cursor: pointer; color: var(--text-secondary); }
         el('td', { class: 'num', text: run.sampled }),
         el('td', { class: 'num', text: run.firstRoundPassed }),
         el('td', { class: 'num', text: run.secondRoundPassed }),
+        el('td', { class: 'num', text: run.coarseCandidates ? `${run.coarsePassed}/${run.coarseCandidates}` : '-' }),
         el('td', { class: 'num', text: `${run.httpPassed}/${run.httpCandidates}` }),
         el('td', null, statusBadge(ok, '', ''), ' ', el('span', { class: ok ? 'mono' : 'muted', text: result }))));
     }
