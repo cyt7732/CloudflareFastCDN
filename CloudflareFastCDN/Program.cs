@@ -48,6 +48,17 @@ namespace CloudflareFastCDN
         private const int CoarseScreenFallbackCount = 8;     // 粗筛全军覆没时回退 TCP 前 N 个
         private static readonly TimeSpan CoarseScreenProbeInterval = TimeSpan.FromSeconds(2);
 
+        // ── 冷启动稳定性门槛 ──────────────────────────────────────────
+        // 低频访问每次都是新连接，稳态再快也扛不住「隔几次就给你抽风一个 1.5 秒」。
+        // 精测阶段额外做 3 次全新连接探测（测完整建连+TLS+请求）：
+        //   冷启动中位 > 700ms  → 典型值就已经很慢
+        //   冷启动 cv  > 0.5    → 典型值还行，但忽快忽慢，实测见过 0.36 秒和 1.8 秒交替
+        // 命中任一条件直接判不通过，不让它进排名、更不会被分配。
+        private const int ColdProbeCount = 3;
+        private static readonly TimeSpan ColdProbeInterval = TimeSpan.FromSeconds(2);
+        private const double ColdMedianThresholdMs = 700;
+        private const double ColdCvThreshold = 0.5;
+
         private static readonly TimeSpan SupplementalHttpCheckInterval = TimeSpan.FromMinutes(5);
         private const int SupplementalHttpCheckCount = 3;
 
@@ -996,18 +1007,47 @@ namespace CloudflareFastCDN
                 var stats = ProbeScore.Compute(probe);
 
                 var passed = !probe.SkipNode && probe.Success >= HttpMinSuccessCount && stats.Valid;
+                string? failReason = passed ? null : FormatError(probe.Error);
+                var coldMedian = 0d;
+                var coldCv = 0d;
+
+                if (passed)
+                {
+                    // 冷启动稳定性检测：HTTP 探测过了才值得再花这点时间，防住「稳态快、新连接抽风」
+                    var coldSamples = await httpPing.ColdProbeAsync(ip, ColdProbeCount, ColdProbeInterval);
+                    (coldMedian, coldCv) = ProbeScore.Analyze(coldSamples);
+
+                    if (coldSamples.Count < 2)
+                    {
+                        passed = false;
+                        failReason = $"冷启动有效样本不足（{coldSamples.Count}/{ColdProbeCount}）";
+                    }
+                    else if (coldMedian > ColdMedianThresholdMs || coldCv > ColdCvThreshold)
+                    {
+                        passed = false;
+                        failReason = $"冷启动不稳（中位 {coldMedian:0}ms，cv {coldCv:0.00}）";
+                    }
+                }
+
                 if (passed)
                 {
                     scored.Add((ip, stats.Score, TimeSpan.FromMilliseconds(stats.WarmMs), stats.ColdMs));
                     Console.WriteLine(
                         $"最终结果 [{index}] {ip} 成功 {probe.Success}/{HttpProbeCount} " +
                         $"冷启动 {stats.ColdMs:0.00}ms 稳态 {stats.WarmMs:0.00}ms → 评分 {stats.Score:0.00}" +
-                        $"（稳态cv {stats.CvWarm:0.00}，丢包 {stats.LossRate:P0}）");
+                        $"（稳态cv {stats.CvWarm:0.00}，丢包 {stats.LossRate:P0}；" +
+                        $"冷启动3测 中位 {coldMedian:0}ms cv {coldCv:0.00}）");
+                }
+                else if (probe.Success >= HttpMinSuccessCount && stats.Valid)
+                {
+                    // HTTP 本身没问题，是冷启动关被刷下来
+                    failedCandidates.Add(ip);
+                    Console.WriteLine($"最终结果 [{index}] {ip} HTTP 通过，但{failReason} → 淘汰");
                 }
                 else
                 {
                     failedCandidates.Add(ip);
-                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.Success}/{HttpProbeCount} 未通过：{FormatError(probe.Error)}");
+                    Console.WriteLine($"最终结果 [{index}] {ip} 成功 {probe.Success}/{HttpProbeCount} 未通过：{failReason}");
                 }
 
                 DashboardState.UpdateRun(run =>
@@ -1020,7 +1060,7 @@ namespace CloudflareFastCDN
                         HttpTotal = HttpProbeCount,
                         HttpAvgMs = stats.Valid ? Math.Round(stats.WarmMs, 2) : null,
                         Passed = passed,
-                        Error = passed ? null : FormatError(probe.Error)
+                        Error = failReason
                     });
                     run.HttpPassed = scored.Count;
                 });

@@ -114,6 +114,43 @@ namespace CloudflareFastCDN.Utils
             return (pingResult.success, pingResult.delay, pingResult.error);
         }
 
+        /// <summary>
+        /// 冷启动探测：每次都用**全新连接**（新建 HttpClient），测完整「建连 + TLS + 请求」的时间。
+        ///
+        /// 用途：识别「稳态很快、但每次新连接偶尔抽风」的 IP。
+        /// 现有 PingWithOutcome 复用连接，只能看到第 1 次冷启动，之后都是热路径，
+        /// 看不出「这个 IP 隔几次就给你来一个 1.5 秒」——而低频访问每次都是新连接，
+        /// 这种抖动才是最伤体验的。这里连测 N 次，用中位数和离散系数衡量真实稳定性。
+        /// </summary>
+        internal async Task<IReadOnlyList<double>> ColdProbeAsync(IPAddress ip, int count, TimeSpan interval)
+        {
+            var results = new List<double>(count);
+            var probeTimeout = TimeSpan.FromMilliseconds(AppConfig.HttpProbeTimeoutMs);
+
+            for (int i = 0; i < count; i++)
+            {
+                // 每次循环用独立 client，dispose 即断开，保证下一次是真正的冷启动
+                using var client = CreateClient(ip, probeTimeout);
+                var pingResult = await SendProbeAsync(client, probeTimeout);
+                if (pingResult.success)
+                {
+                    results.Add(pingResult.delay.TotalMilliseconds);
+                }
+                else if (pingResult.skipNode)
+                {
+                    // 超时/403 直接放弃余下探测
+                    break;
+                }
+
+                if (i < count - 1 && interval > TimeSpan.Zero)
+                {
+                    await Task.Delay(interval);
+                }
+            }
+
+            return results;
+        }
+
         public async Task<(bool success, bool missing, double mbps, long bytesRead, TimeSpan duration, string error)> SpeedTest(IPAddress ip, int maxBytes = DefaultSpeedTestBytes)
         {
             var speedTestTimeout = TimeSpan.FromMilliseconds(AppConfig.HttpSpeedTestTimeoutMs);

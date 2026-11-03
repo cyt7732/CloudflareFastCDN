@@ -96,6 +96,27 @@ namespace CloudflareFastCDN.Utils
                 ? sorted[mid]
                 : (sorted[mid - 1] + sorted[mid]) / 2;
         }
+
+        /// <summary>
+        /// 把一串样本归纳成「中位数 + 离散系数」。冷启动探测用它判断稳不稳：
+        /// 中位数代表典型值，cv 代表偶尔抽风的程度（cv 越大越不稳）。
+        /// </summary>
+        public static (double Median, double Cv) Analyze(IReadOnlyList<double> samples)
+        {
+            if (samples.Count == 0)
+                return (0, 0);
+
+            var median = Median(samples);
+            if (samples.Count < 2)
+                return (median, 0);
+
+            var mean = samples.Average();
+            if (mean <= 0)
+                return (median, 0);
+
+            var variance = samples.Average(x => Math.Pow(x - mean, 2));
+            return (median, Math.Sqrt(variance) / mean);
+        }
     }
 
     public sealed class ProbeResult
