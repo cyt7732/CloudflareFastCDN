@@ -391,6 +391,14 @@ namespace CloudflareFastCDN
             var regularInterval = TimeSpan.FromMinutes(AppConfig.RunMinutes);
             if (regularInterval <= TimeSpan.Zero)
             {
+                // 连续跑模式下，如果本轮一个可用 IP 都没选出来（通常是网络异常或整片超时），
+                // 必须强制歇一下，否则会「失败 → 立刻重跑 → 再失败」把请求打爆。
+                if (selection.AssignedIps.Count == 0)
+                {
+                    Console.WriteLine("本轮没有可用 IP，歇 60 秒后重试（避免空轮死循环）");
+                    await Task.Delay(TimeSpan.FromMinutes(1));
+                }
+
                 Console.WriteLine("RUN_MINUTES 小于等于0，立即开始下一轮优选");
                 return "定时优选";
             }
