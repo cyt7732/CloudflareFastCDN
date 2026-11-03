@@ -1,9 +1,10 @@
 <div align="center">
 
-# CloudflareFastCDN · 增强版
+# CloudflareFastCDN Pro
 
 **自动优选 Cloudflare CDN IP，持续更新 DNS A 记录**
 
+[![Release](https://img.shields.io/github/v/release/cyt7732/CloudflareFastCDN?display_name=tag)](https://github.com/cyt7732/CloudflareFastCDN/releases)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/cyt7732/CloudflareFastCDN/pkgs/container/cloudflarefastcdn)
 [![.NET](https://img.shields.io/badge/.NET-9.0-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
@@ -41,17 +42,22 @@
 ### 筛选流程
 
 ```
-每轮（默认 60 分钟）
+每轮（RUN_MINUTES，默认 60 分钟；测试环境用 5 分钟）
   │
-  ├─ 抽样 1000 个
-  │   ├─ 70% 网段加权（从历史高分 /24 网段抽）
-  │   └─ 30% 全量随机（探索新网段）
+  ├─ 抽样 MAX_IPS 个
+  │   ├─ 50% 网段加权（从历史高分 /24 网段抽）
+  │   └─ 50% 全量随机（探索新网段）
   │
   ├─ TCP 快筛（443 端口，4 次允许丢 1 次）
   │
-  ├─ 候选 = 种子库 10 个 + TCP 延迟最低 10 个 + 当前 IP（如不在种子库）
+  ├─ 粗筛候选 = TCP 延迟最低 60 个
   │
-  ├─ 全部做 HTTP 验证（5 次探测，间隔 5~8 秒）
+  ├─ 并发粗筛（6 路，每候选 3 次探测、间隔 2 秒）
+  │   └─ 只做淘汰，不参与最终排名
+  │
+  ├─ 精测候选 = 种子库前 4 + 粗筛前 8 + 当前 IP（如不在其中）
+  │
+  ├─ 串行精测（5 次探测，间隔 5~8 秒）
   │   ├─ 第 1 次 = 冷启动（新建 TCP + TLS），单独记录，不参与排名
   │   └─ 第 2 次起 = 稳态，取中位数 → 评分 = 稳态中位数 × (1 + 稳态cv) × (1 + 丢包率)
   │

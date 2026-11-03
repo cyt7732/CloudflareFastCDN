@@ -1,21 +1,46 @@
-name: Build and Publish GHCR
+name: Build and Release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号（如 v2.2.0）。留空只构建镜像，不发 Release'
+        required: false
+        type: string
+      build_ref:
+        description: '要构建的提交（留空用当前分支最新）。补发历史版本时填提交号'
+        required: false
+        type: string
   push:
     tags:
       - 'v*.*.*'
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
   docker:
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.ver.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.build_ref || github.ref }}
+
+      # 版本号来源：手动触发填的输入 > 标签推送时的标签名
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          if [ -z "$V" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            V="${{ github.ref_name }}"
+          fi
+          echo "tag=$V" >> "$GITHUB_OUTPUT"
+          echo "版本号：${V:-(空，仅构建镜像)}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -31,8 +56,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set GHCR image name
+        id: ghcr
         shell: bash
-        run: echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # 镜像标签：latest + 提交 sha + 版本号（没有版本号时只打前两个）
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ghcr.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+            type=raw,value=${{ steps.ver.outputs.tag }},enable=${{ steps.ver.outputs.tag != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -41,6 +78,36 @@ jobs:
           file: ${{ github.workspace }}/CloudflareFastCDN/Dockerfile
           push: true
           platforms: linux/amd64
-          tags: |
-            ${{ env.GHCR_IMAGE }}:latest
-            ${{ env.GHCR_IMAGE }}:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # 有版本号才发 Release；正文始终取默认分支最新 CHANGELOG
+  release:
+    needs: docker
+    if: needs.docker.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract changelog section
+        id: changelog
+        run: python3 .github/scripts/extract_changelog.py "${{ needs.docker.outputs.release_tag }}"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.docker.outputs.release_tag }}"
+          DESC="${{ steps.changelog.outputs.desc }}"
+          if [ -n "$DESC" ]; then
+            TITLE="$TAG $DESC"
+          else
+            TITLE="$TAG"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，按 CHANGELOG 更新"
+            gh release edit "$TAG" --title "$TITLE" --notes-file release-body.md
+          else
+            gh release create "$TAG" --title "$TITLE" --notes-file release-body.md
+          fi
