@@ -211,7 +211,7 @@ namespace CloudflareFastCDN.Web
             UpdateRun(_ => { }, detail);
         }
 
-        public static void CompleteRun(IEnumerable<(int Rank, string Ip, double DelayMs)> assignedIps)
+        public static void CompleteRun(IEnumerable<(int Rank, string Ip, double DelayMs, double ColdMs)> assignedIps)
         {
             lock (SyncRoot)
             {
@@ -224,7 +224,7 @@ namespace CloudflareFastCDN.Web
                 _currentRun = null;
                 run.FinishedAt = DateTimeOffset.Now;
                 run.Assigned = assignedIps
-                    .Select(item => new RunAssignment { Rank = item.Rank, Ip = item.Ip, DelayMs = Round(item.DelayMs) })
+                    .Select(item => new RunAssignment { Rank = item.Rank, Ip = item.Ip, DelayMs = Round(item.DelayMs), ColdMs = Round(item.ColdMs) })
                     .ToList();
                 run.Note = run.Assigned.Count > 0 ? $"已分配{run.Assigned.Count}个IP"
                     : run.HttpCandidates == 0 ? "没有IP进入HTTP验证阶段"
@@ -248,7 +248,7 @@ namespace CloudflareFastCDN.Web
                     });
                 }
 
-                SetAssignedIps(run.Assigned.Select(item => (item.Rank, item.Ip, item.DelayMs, 0d)));
+                SetAssignedIps(run.Assigned.Select(item => (item.Rank, item.Ip, item.DelayMs, item.ColdMs)));
                 SaveHistory();
             }
         }
@@ -475,7 +475,12 @@ namespace CloudflareFastCDN.Web
     {
         public int Rank { get; set; }
         public string Ip { get; set; } = string.Empty;
+
+        /// <summary>稳态延时。</summary>
         public double DelayMs { get; set; }
+
+        /// <summary>冷启动延时。</summary>
+        public double ColdMs { get; set; }
     }
 
     internal sealed class DomainGroupInfo

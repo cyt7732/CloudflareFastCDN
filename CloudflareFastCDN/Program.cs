@@ -762,7 +762,7 @@ namespace CloudflareFastCDN
             Console.WriteLine($"开始全量优选，触发原因：{trigger}");
 
             var selection = await RunFullSelection(dnsUpdateProviders);
-            DashboardState.CompleteRun(selection.AssignedIps.Select(item => (item.Rank, item.IP.ToString(), item.BaselineDelay.TotalMilliseconds)));
+            DashboardState.CompleteRun(selection.AssignedIps.Select(item => (item.Rank, item.IP.ToString(), item.BaselineDelay.TotalMilliseconds, item.ColdMs)));
             return selection;
         }
 
