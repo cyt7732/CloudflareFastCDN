@@ -65,7 +65,7 @@ namespace CloudflareFastCDN.Settings
             new("HTTP_SPEEDTEST_TIMEOUT_MS", GroupHttp, "测速总超时（毫秒）", SettingType.Integer, "10000", "单次下载测速的总超时时间", Min: 100, Max: 600000),
             new("HTTP_SPEEDTEST_IDLE_TIMEOUT_MS", GroupHttp, "测速空闲超时（毫秒）", SettingType.Integer, "3000", "下载测速时读取数据的空闲超时时间", Min: 100, Max: 600000),
 
-            new("RUN_MINUTES", GroupSchedule, "检测周期（分钟）", SettingType.Integer, "60", "每轮完成后等待的分钟数，到期后先复检已分配 IP", Min: 1, Max: 10080),
+            new("RUN_MINUTES", GroupSchedule, "检测周期（分钟）", SettingType.Integer, "60", "每轮完成后等待的分钟数；填 0 表示测完立刻开始下一轮（连续跑模式）", Min: 0, Max: 10080),
             new("ENABLE_SUPPLEMENTAL_HTTP_CHECK", GroupSchedule, "补充 HTTP 检查", SettingType.Boolean, "false", "等待期间每 5 分钟检查一次当前最优 IP，连续 3 次失败则提前重新优选"),
             new("FORCE_INITIAL_FULL_SELECTION", GroupSchedule, "启动时强制全量优选", SettingType.Boolean, "false", "跳过首次启动的域名 IP 预检，直接执行全量优选", RestartRequired: true),
             new("DRY_RUN", GroupSchedule, "演练模式（不写 DNS）", SettingType.Boolean, "false", "照常抽样、探测和评分，但完全跳过 DNS 记录更新，用于验证新版本而不影响线上域名", RestartRequired: true),

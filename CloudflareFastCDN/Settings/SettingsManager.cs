@@ -333,7 +333,7 @@ namespace CloudflareFastCDN.Settings
             AppConfig.HttpProbeTimeoutMs = ParsePositiveIntWithDefault(Value("HTTP_PROBE_TIMEOUT_MS"), 4000);
             AppConfig.HttpSpeedTestTimeoutMs = ParsePositiveIntWithDefault(Value("HTTP_SPEEDTEST_TIMEOUT_MS"), 10000);
             AppConfig.HttpSpeedTestIdleTimeoutMs = ParsePositiveIntWithDefault(Value("HTTP_SPEEDTEST_IDLE_TIMEOUT_MS"), 3000);
-            AppConfig.RunMinutes = ParseNonZeroIntWithDefault(Value("RUN_MINUTES"), 60);
+            AppConfig.RunMinutes = ParseNonNegativeIntWithDefault(Value("RUN_MINUTES"), 60);
             AppConfig.BandwidthPriority = ParseBoolWithDefault(Value("BANDWIDTH_PRIORITY"), false);
             AppConfig.UpdateIPList = ParseBoolWithDefault(Value("UPDATE_IP_LIST"), false);
             AppConfig.EnableSupplementalHttpCheck = ParseBoolWithDefault(Value("ENABLE_SUPPLEMENTAL_HTTP_CHECK"), false);
@@ -598,6 +598,13 @@ namespace CloudflareFastCDN.Settings
         private static int ParseNonZeroIntWithDefault(string? value, int defaultValue)
         {
             return int.TryParse(value, out var result) && result != 0
+                ? result
+                : defaultValue;
+        }
+
+        private static int ParseNonNegativeIntWithDefault(string? value, int defaultValue)
+        {
+            return int.TryParse(value, out var result) && result >= 0
                 ? result
                 : defaultValue;
         }
