@@ -22,12 +22,32 @@ namespace CloudflareFastCDN
         private static readonly TimeSpan AssignedDelayMinimumThreshold = TimeSpan.FromMilliseconds(300);
         private static readonly TimeSpan FinalProbeMinInterval = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan FinalProbeMaxInterval = TimeSpan.FromSeconds(8);
-        private static readonly TimeSpan FinalCandidateMinInterval = TimeSpan.FromSeconds(30);
-        private static readonly TimeSpan FinalCandidateMaxInterval = TimeSpan.FromSeconds(45);
+        // 候选之间的等待。原来 30~45 秒是串行时代的保守值：
+        // 一个候选只测 5 次，却要在候选之间空等半分钟，整轮 20 个候选光等待就吃掉 12 分钟。
+        // 实测单个候选内部 5~8 秒的探测间隔已经足够，候选之间不需要更长。
+        private static readonly TimeSpan FinalCandidateMinInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan FinalCandidateMaxInterval = TimeSpan.FromSeconds(8);
         private const int SubnetProbePingCount = 2;
         private const int SubnetSampleCount = 6;
-        private const int NewCandidateCount = 10;   // 每轮从 TCP 快筛里取多少个新 IP
         private const int SeedPoolCapacity = 10;    // 种子库容量
+
+        // ── 两级验证：并发粗筛 + 串行精测 ────────────────────────────────
+        // 串行精测每个候选约 35 秒（5 次探测 + 5~8 秒间隔），是吞吐的唯一瓶颈。
+        // 原来 TCP 通过后直接全量串行精测，20 个候选 21 分钟、每小时只能验证 14 个 IP。
+        // 现在先用并发粗筛淘汰明显差的，只让少数候选进精测：
+        //   粗筛：60 个候选 × 3 次探测，6 路并发，约 1 分钟
+        //   精测：8 个粗筛优胜 + 4 个种子 + 当前 IP，串行出精确分
+        // 关键约束：并发只用于粗筛，最终排名一定串行精测 ——
+        // 并发时互相抢带宽，测出来的是「拥堵环境下的表现」，不能用于切换判定。
+        private const int CoarseScreenCandidateCount = 60;   // 每轮粗筛候选数（TCP 通过里延时最低的）
+        private const int CoarseScreenConcurrency = 6;       // 粗筛并发路数
+        private const int CoarseScreenProbeCount = 3;        // 粗筛每个候选探测次数（1 冷 + 2 热）
+        private const int CoarseScreenMinSuccess = 2;        // 3 次里至少成功 2 次才算通过粗筛
+        private const int CoarseScreenPassCount = 8;         // 粗筛后进入精测的数量
+        private const int SeedRefineCount = 4;               // 种子库每轮精测数量（不再全测 10 个）
+        private const int CoarseScreenFallbackCount = 8;     // 粗筛全军覆没时回退 TCP 前 N 个
+        private static readonly TimeSpan CoarseScreenProbeInterval = TimeSpan.FromSeconds(2);
+
         private static readonly TimeSpan SupplementalHttpCheckInterval = TimeSpan.FromMinutes(5);
         private const int SupplementalHttpCheckCount = 3;
 
@@ -766,6 +786,55 @@ namespace CloudflareFastCDN
             return selection;
         }
 
+        /// <summary>
+        /// 并发粗筛：快速淘汰明显差的候选，只把有希望的送进串行精测。
+        /// 3 次探测（1 冷 + 2 热）、2 秒间隔、6 路并发，目的不是精确评分，
+        /// 而是「别让一个慢 IP 占着串行队列空耗 35 秒」。最终排名仍由串行精测决定。
+        /// </summary>
+        private static async Task<List<(IPAddress Ip, double Score)>> CoarseScreenAsync(
+            IReadOnlyList<IPAddress> candidates,
+            Httping httpPing)
+        {
+            var passed = new List<(IPAddress Ip, double Score)>();
+            var gate = new SemaphoreSlim(Math.Max(1, CoarseScreenConcurrency));
+            var done = 0;
+            var total = candidates.Count;
+
+            var tasks = candidates.Select(async ip =>
+            {
+                await gate.WaitAsync();
+                try
+                {
+                    // 粗筛不进入 5 分钟退避：一个 403 卡住整轮不划算，直接判失败
+                    var probe = await httpPing.PingWithOutcome(
+                        ip,
+                        CoarseScreenProbeCount,
+                        CoarseScreenProbeInterval,
+                        CoarseScreenProbeInterval,
+                        pauseOnBackoff: false);
+                    var stats = ProbeScore.Compute(probe);
+
+                    if (!probe.SkipNode && probe.Success >= CoarseScreenMinSuccess && stats.Valid)
+                    {
+                        lock (passed)
+                        {
+                            passed.Add((ip, stats.Score));
+                        }
+                    }
+
+                    var n = Interlocked.Increment(ref done);
+                    DashboardState.SetSelectionDetail($"HTTP粗筛 {n}/{total} {ip}");
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }).ToArray();
+
+            await Task.WhenAll(tasks);
+            return passed.OrderBy(item => item.Score).ToList();
+        }
+
         private static async Task<SelectionResult> RunFullSelection(IReadOnlyList<DnsUpdateProvider> dnsUpdateProviders)
         {
             var processor = new IPProcessor();
@@ -865,23 +934,43 @@ namespace CloudflareFastCDN
                 return SelectionResult.Empty;
             }
 
-            // 3. 新候选 = TCP 延迟最低的 N 个
-            var newCandidates = tcpPassed.Take(NewCandidateCount).Select(item => item.IP).ToList();
-            Console.WriteLine($"新候选：{newCandidates.Count} 个（TCP 延迟最低）");
+            // 3. 粗筛候选 = TCP 延迟最低的 N 个
+            var coarseCandidates = tcpPassed.Take(CoarseScreenCandidateCount).Select(item => item.IP).ToList();
+            Console.WriteLine($"HTTP 粗筛候选：{coarseCandidates.Count} 个（TCP 延迟最低，{CoarseScreenConcurrency} 路并发）");
+            DashboardState.SetSelectionDetail($"HTTP粗筛（{coarseCandidates.Count}个IP，{CoarseScreenConcurrency}路并发）");
 
-            // 4. 候选 = 种子 + 新 + 当前 IP（保证当前 IP 每轮都被测，不会脱管）
-            var candidates = seedIps.Concat(newCandidates).Distinct().ToList();
+            // 4. 并发粗筛：只留少数有希望的进串行精测
+            var httpPing = new Httping();
+            var coarseStarted = DateTimeOffset.Now;
+            var coarsePassed = await CoarseScreenAsync(coarseCandidates, httpPing);
+            var coarseSeconds = (DateTimeOffset.Now - coarseStarted).TotalSeconds;
+            Console.WriteLine($"HTTP 粗筛：{coarsePassed.Count}/{coarseCandidates.Count} 通过，耗时 {coarseSeconds:0} 秒");
+
+            List<IPAddress> refineIps;
+            if (coarsePassed.Count > 0)
+            {
+                refineIps = coarsePassed.Take(CoarseScreenPassCount).Select(item => item.Ip).ToList();
+            }
+            else
+            {
+                // 粗筛全军覆没（多半是整体网络异常），回退 TCP 顺序，避免整轮空转
+                refineIps = tcpPassed.Take(CoarseScreenFallbackCount).Select(item => item.IP).ToList();
+                Console.WriteLine($"粗筛无候选通过，回退到 TCP 顺序前 {refineIps.Count} 个");
+            }
+
+            // 5. 精测候选 = 种子库最优的几个 + 粗筛优胜 + 当前 IP（保证当前 IP 每轮都被测，不会脱管）
+            var seedRefineIps = seedIps.Take(SeedRefineCount).ToList();
+            var candidates = seedRefineIps.Concat(refineIps).Distinct().ToList();
             if (IPAddress.TryParse(switchState.CurrentIp, out var currentCandidateIp) && !candidates.Contains(currentCandidateIp))
             {
                 candidates.Add(currentCandidateIp);
                 Console.WriteLine($"当前 IP {currentCandidateIp} 不在种子库，已强制加入候选池");
             }
-            Console.WriteLine($"本轮候选：{candidates.Count} 个（种子 {seedIps.Count} + 新 {newCandidates.Count}）");
+            Console.WriteLine($"本轮精测：{candidates.Count} 个（种子 {seedRefineIps.Count} + 粗筛 {refineIps.Count} + 当前IP）");
 
-            DashboardState.UpdateRun(run => run.HttpCandidates = candidates.Count, $"HTTP 验证（{candidates.Count}个IP）");
+            DashboardState.UpdateRun(run => run.HttpCandidates = candidates.Count, $"HTTP 精测（{candidates.Count}个IP）");
 
-            // 5. 全部做 HTTP 验证
-            var httpPing = new Httping();
+            // 6. 串行精测
             var scored = new List<(IPAddress Ip, double Score, TimeSpan Delay, double ColdMs)>();
             var failedCandidates = new List<IPAddress>();
             var seedSet = new HashSet<IPAddress>(seedIps);

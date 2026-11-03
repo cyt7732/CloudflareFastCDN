@@ -367,3 +367,6 @@ FodyWeavers.xsd
 
 # 本地分析与测试脚本（不纳入版本控制）
 .sim/
+
+# 本地助手记忆与工作记录
+.deepseek-harness/

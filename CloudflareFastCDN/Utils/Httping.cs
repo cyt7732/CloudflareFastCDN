@@ -25,7 +25,11 @@ namespace CloudflareFastCDN.Utils
         /// 第 1 次是冷启动（新建 TCP + TLS 握手），第 2 次起走连接复用 ——
         /// 两者必须分开统计，不能平均，原因见 ProbeStats 的注释。
         /// </summary>
-        internal async Task<ProbeStats> PingWithOutcome(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null)
+        /// <param name="pauseOnBackoff">
+        /// 遇到 403/429 时是否暂停 5 分钟再继续。串行精测必须暂停（防止被拉黑）；
+        /// 并发粗筛不能暂停 —— 一个候选卡 5 分钟会把整轮拖死，粗筛只做淘汰，直接判失败即可。
+        /// </param>
+        internal async Task<ProbeStats> PingWithOutcome(IPAddress ip, int pingCount = 3, TimeSpan? minInterval = null, TimeSpan? maxInterval = null, bool pauseOnBackoff = true)
         {
             var probeTimeout = TimeSpan.FromMilliseconds(AppConfig.HttpProbeTimeoutMs);
             using var client = CreateClient(ip, probeTimeout);
@@ -71,7 +75,7 @@ namespace CloudflareFastCDN.Utils
                     };
                 }
 
-                if (pingResult.shouldBackoff)
+                if (pingResult.shouldBackoff && pauseOnBackoff)
                 {
                     await PauseAfterBackoffAsync(pingResult.error);
                 }
