@@ -97,15 +97,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ needs.docker.outputs.release_tag }}"
-          DESC="${{ steps.changelog.outputs.desc }}"
-          if [ -n "$DESC" ]; then
-            TITLE="$TAG $DESC"
-          else
-            TITLE="$TAG"
-          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，按 CHANGELOG 更新"
-            gh release edit "$TAG" --title "$TITLE" --notes-file release-body.md
+            gh release edit "$TAG" --title "$TAG" --notes-file release-body.md
           else
-            gh release create "$TAG" --title "$TITLE" --notes-file release-body.md
+            gh release create "$TAG" --title "$TAG" --notes-file release-body.md
           fi

@@ -27,21 +27,8 @@ def main() -> int:
         body = f"{tag}：该版本未在 CHANGELOG.md 中记录。"
         print(f"警告：CHANGELOG.md 中找不到 v{ver} 章节", file=sys.stderr)
 
-    # 第一段非标题文字作为 Release 标题的描述部分（标题不带句号）
-    desc = next(
-        (line.strip() for line in body.splitlines() if line.strip() and not line.startswith("#")),
-        "",
-    )
-    desc = desc.rstrip("。.")
-
     pathlib.Path("release-body.md").write_text(body + "\n", encoding="utf-8")
-
-    gh_output = os.environ.get("GITHUB_OUTPUT")
-    if gh_output:
-        with open(gh_output, "a", encoding="utf-8") as handle:
-            handle.write(f"desc={desc}\n")
-
-    print(f"版本 {ver}：正文 {len(body)} 字符，描述「{desc}」")
+    print(f"版本 {ver}：正文 {len(body)} 字符")
     return 0
 
 
