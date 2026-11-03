@@ -4,11 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '要发布的版本号（如 v2.2.0）。留空只构建镜像，不发 Release'
-        required: false
-        type: string
-      build_ref:
-        description: '要构建的提交（留空用当前分支最新）。补发历史版本时填提交号'
+        description: '要发布的版本号（如 v2.2.0），同时作为构建目标标签。留空只构建当前分支镜像'
         required: false
         type: string
   push:
@@ -25,10 +21,11 @@ jobs:
     outputs:
       release_tag: ${{ steps.ver.outputs.tag }}
     steps:
+      # 有版本号就构建对应标签（必须先打好标签），否则构建当前分支
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.build_ref || github.ref }}
+          ref: ${{ inputs.version || github.ref }}
 
       # 版本号来源：手动触发填的输入 > 标签推送时的标签名
       - name: Resolve version
