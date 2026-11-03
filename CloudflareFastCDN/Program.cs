@@ -37,6 +37,11 @@ namespace CloudflareFastCDN
         private const double TcpWorstScore = 900;
         private const double TcpLossPenalty = 300;  // 丢一个包（4 中 3）加 75 分
 
+        // 网段分数表的标尺是历史沿用的（好网段 ≈ 250~300，默认分 500）。
+        // 新的 ProbeScore 口径下好 IP 只有 ~100~140，直接喂进去会把「出过好 IP 的网段」
+        // 权重放大 9 倍，等于把那十几个网段锁死。这里换算回同一标尺。
+        private const double SubnetHitScoreScale = 2.3;
+
         private static List<DnsUpdateProvider>? _dnsUpdateProviders;
         private static int _dnsUpdateProvidersVersion = -1;
 
@@ -945,10 +950,10 @@ namespace CloudflareFastCDN
             DashboardState.SetSeedPoolInfo(seedPool.GetEntries().Select(r => (r.Ip, r.Score, r.DelayMs, r.LastSeen)));
             Console.WriteLine($"种子库更新：本轮入库 {seedCount} 个，当前共 {seedPool.Count} 个");
 
-            // 8. 更新网段分数表
+            // 8. 更新网段分数表（换算到网段表自己的标尺，见 SubnetHitScoreScale）
             foreach (var item in scored)
             {
-                subnetTable.RecordHit(item.Ip, item.Score);
+                subnetTable.RecordHit(item.Ip, item.Score * SubnetHitScoreScale);
             }
             subnetTable.Save();
             Console.WriteLine($"网段分数表：已记录 {subnetTable.Count}/{subnetTable.TotalSubnets} 个网段（本轮失败 {failedCandidates.Count} 个）");
