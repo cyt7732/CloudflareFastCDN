@@ -27,11 +27,12 @@ def main() -> int:
         body = f"{tag}：该版本未在 CHANGELOG.md 中记录。"
         print(f"警告：CHANGELOG.md 中找不到 v{ver} 章节", file=sys.stderr)
 
-    # 第一段非标题文字作为 Release 标题的描述部分
+    # 第一段非标题文字作为 Release 标题的描述部分（标题不带句号）
     desc = next(
         (line.strip() for line in body.splitlines() if line.strip() and not line.startswith("#")),
         "",
     )
+    desc = desc.rstrip("。.")
 
     pathlib.Path("release-body.md").write_text(body + "\n", encoding="utf-8")
 

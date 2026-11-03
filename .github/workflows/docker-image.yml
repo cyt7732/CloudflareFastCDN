@@ -23,6 +23,7 @@ jobs:
     steps:
       # 有版本号就构建对应标签（必须先打好标签），否则构建当前分支
       - name: Checkout
+        id: co
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.version || github.ref }}
@@ -57,7 +58,7 @@ jobs:
         shell: bash
         run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      # 镜像标签：latest + 提交 sha + 版本号（没有版本号时只打前两个）
+      # 镜像标签：latest + 实际构建提交的 sha + 版本号（没有版本号时只打前两个）
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -65,7 +66,7 @@ jobs:
           images: ${{ steps.ghcr.outputs.image }}
           tags: |
             type=raw,value=latest
-            type=sha,format=long
+            type=sha,format=long,value=${{ steps.co.outputs.commit }}
             type=raw,value=${{ steps.ver.outputs.tag }},enable=${{ steps.ver.outputs.tag != '' }}
 
       - name: Build and push
