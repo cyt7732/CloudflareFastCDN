@@ -125,6 +125,10 @@ namespace CloudflareFastCDN
             Console.WriteLine($"  WEB_PORT: {AppConfig.WebPort}");
             Console.WriteLine($"  WEB_HOST: {AppConfig.WebHost}");
             Console.WriteLine($"  DNS提供商: {(TryBuildDnsUpdateProviders(out var providers, out _) ? string.Join(", ", providers.Select(provider => provider.ProviderName)) : "(未配置)")}");
+            if (AppConfig.DryRun)
+            {
+                Console.WriteLine("  ★ 演练模式已开启（DRY_RUN=true）：正常探测与评分，但不写任何 DNS 记录");
+            }
             foreach (var item in SettingsManager.BuildSummary())
             {
                 Console.WriteLine($"  {item.Key}: {item.Value}");
@@ -626,11 +630,16 @@ namespace CloudflareFastCDN
                 {
                     try
                     {
-                        var updated = await provider.Manager.AddOrUpdateARecord(domain, best.IP.ToString());
+                        var updated = AppConfig.DryRun
+                            ? LogDryRunUpdate(provider.ProviderName, domain, best.IP.ToString())
+                            : await provider.Manager.AddOrUpdateARecord(domain, best.IP.ToString());
                         if (updated)
                         {
                             assignedIpsByRank.TryAdd(0, best);
-                            Console.WriteLine($"灾备更新[{provider.ProviderName}] {domain} → {best.IP}");
+                            if (!AppConfig.DryRun)
+                            {
+                                Console.WriteLine($"灾备更新[{provider.ProviderName}] {domain} → {best.IP}");
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -1006,12 +1015,23 @@ namespace CloudflareFastCDN
                     var updated = false;
                     try
                     {
-                        Console.WriteLine($"开始更新[{provider.ProviderName}]域名 {domain} → {top.Ip}");
-                        updated = await provider.Manager.AddOrUpdateARecord(domain, top.Ip.ToString());
+                        if (AppConfig.DryRun)
+                        {
+                            updated = LogDryRunUpdate(provider.ProviderName, domain, top.Ip.ToString());
+                        }
+                        else
+                        {
+                            Console.WriteLine($"开始更新[{provider.ProviderName}]域名 {domain} → {top.Ip}");
+                            updated = await provider.Manager.AddOrUpdateARecord(domain, top.Ip.ToString());
+                        }
+
                         if (updated)
                         {
                             assignedIpsByRank.TryAdd(0, new AssignedIp(top.Ip, top.Delay, 1, top.Score, top.ColdMs));
-                            Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
+                            if (!AppConfig.DryRun)
+                            {
+                                Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -1103,6 +1123,16 @@ namespace CloudflareFastCDN
         private static string FormatError(string? error)
         {
             return string.IsNullOrWhiteSpace(error) ? "Unknown" : error;
+        }
+
+        /// <summary>
+        /// 演练模式（DRY_RUN=true）下代替真实 DNS 更新。
+        /// 只打日志并返回 true，让流程照常往下走 —— 否则「无可用 IP」会触发无限重跑。
+        /// </summary>
+        private static bool LogDryRunUpdate(string providerName, string domain, string ip)
+        {
+            Console.WriteLine($"[演练模式] 本应更新[{providerName}] {domain} → {ip}，已跳过（未发出任何 DNS 请求）");
+            return true;
         }
 
         private sealed class DnsUpdateProvider

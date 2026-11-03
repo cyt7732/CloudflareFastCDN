@@ -338,6 +338,7 @@ namespace CloudflareFastCDN.Settings
             AppConfig.UpdateIPList = ParseBoolWithDefault(Value("UPDATE_IP_LIST"), false);
             AppConfig.EnableSupplementalHttpCheck = ParseBoolWithDefault(Value("ENABLE_SUPPLEMENTAL_HTTP_CHECK"), false);
             AppConfig.ForceInitialFullSelection = ParseBoolWithDefault(Value("FORCE_INITIAL_FULL_SELECTION"), false);
+            AppConfig.DryRun = ParseBoolWithDefault(Value("DRY_RUN"), false);
             var webUsername = Value("WEB_USERNAME");
             AppConfig.WebUsername = string.IsNullOrWhiteSpace(webUsername) ? "admin" : webUsername;
             AppConfig.WebPassword = Value("WEB_PASSWORD");

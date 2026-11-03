@@ -32,6 +32,9 @@ namespace CloudflareFastCDN.Utils
         public static bool EnableSupplementalHttpCheck { get; set; } = false;
         public static bool ForceInitialFullSelection { get; set; } = false;
 
+        /// <summary>演练模式：正常探测和评分，但不写任何 DNS 记录。</summary>
+        public static bool DryRun { get; set; } = false;
+
         public static int WebPort { get; set; } = 19401;
         public static string WebHost { get; set; } = "127.0.0.1";
         public static string WebUsername { get; set; } = "admin";
