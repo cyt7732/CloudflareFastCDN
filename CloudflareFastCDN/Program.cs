@@ -59,6 +59,25 @@ namespace CloudflareFastCDN
         private const double ColdMedianThresholdMs = 700;
         private const double ColdCvThreshold = 0.5;
 
+        // ── 当前 IP 健康监测（连续跑模式下的快速纠偏）─────────────────────
+        // 连续跑时主循环被一轮一轮占满（每轮 10~14 分钟），当前 IP 只在每轮精测时被顺带检查，
+        // 踩到坑要等十几分钟才换。这里起一个独立后台任务，专门盯当前 IP：
+        //   平时每 3 分钟测一次（单次全新连接，测完整首字节）
+        //   一旦偏慢 → 黄牌，改成每 1 分钟测一次
+        //   连续 3 次偏慢（原本那次 + 黄牌 2 次）→ 直接快速切换
+        //   换完回到 3 分钟节奏
+        // 「偏慢」= 单次首字节 > max(基准冷启动 × 1.8, 700ms)，或探测直接失败。
+        private static readonly TimeSpan HealthCheckInterval = TimeSpan.FromMinutes(3);
+        private static readonly TimeSpan HealthYellowInterval = TimeSpan.FromMinutes(1);
+        private const int HealthBadThreshold = 3;
+        private const double HealthSlowRatio = 1.8;
+        private const double HealthSlowFloorMs = 700;
+
+        /// <summary>保护「读当前 IP → 写 DNS → 写切换状态」这一串动作，避免后台监测和主流程同时改 DNS。</summary>
+        private static readonly SemaphoreSlim SwitchLock = new(1, 1);
+
+        private static CancellationTokenSource? _healthCts;
+
         private static readonly TimeSpan SupplementalHttpCheckInterval = TimeSpan.FromMinutes(5);
         private const int SupplementalHttpCheckCount = 3;
 
@@ -120,6 +139,11 @@ namespace CloudflareFastCDN
             }
 
             var dnsUpdateProviders = await GetDnsUpdateProviders();
+
+            // 健康监测尽早启动：第一轮全量优选可能要跑十几分钟，
+            // 期间当前 IP 一旦变慢，后台任务就能发现并切换，不用等主流程。
+            StartHealthMonitor();
+
             SelectionResult selection;
             if (AppConfig.ForceInitialFullSelection)
             {
@@ -631,6 +655,187 @@ namespace CloudflareFastCDN
                 }
             }
             return null;
+        }
+
+        /// <summary>启动当前 IP 健康监测（独立后台任务，不占用主流程的轮次节奏）。</summary>
+        private static void StartHealthMonitor()
+        {
+            _healthCts = new CancellationTokenSource();
+            _ = Task.Run(() => HealthMonitorLoopAsync(_healthCts.Token));
+            Console.WriteLine(
+                $"当前 IP 健康监测已启动：平时每 {HealthCheckInterval.TotalMinutes:0} 分钟检查一次，" +
+                $"连续 {HealthBadThreshold} 次偏慢触发快速切换（黄牌期间每 {HealthYellowInterval.TotalMinutes:0} 分钟）");
+        }
+
+        private static async Task HealthMonitorLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(HealthCheckInterval, ct);
+
+                    var state = SwitchState.Load();
+                    if (string.IsNullOrEmpty(state.CurrentIp))
+                    {
+                        continue;
+                    }
+
+                    var badCount = 0;
+                    while (!ct.IsCancellationRequested)
+                    {
+                        var (slow, ms) = await ProbeCurrentOnceAsync(state.CurrentIp);
+                        if (!slow)
+                        {
+                            if (badCount > 0)
+                            {
+                                Console.WriteLine($"健康检查：当前 IP 恢复正常（{ms:0}ms），解除黄牌");
+                            }
+                            break;
+                        }
+
+                        badCount++;
+                        Console.WriteLine($"健康检查：当前 IP {state.CurrentIp} 偏慢（{(ms > 0 ? $"{ms:0}ms" : "探测失败")}，{badCount}/{HealthBadThreshold}）");
+                        if (badCount >= HealthBadThreshold)
+                        {
+                            break;
+                        }
+
+                        await Task.Delay(HealthYellowInterval, ct);
+                    }
+
+                    if (badCount >= HealthBadThreshold)
+                    {
+                        Console.WriteLine($"健康检查：连续 {HealthBadThreshold} 次偏慢，触发快速切换");
+                        await QuickSwitchAsync("健康检查连续偏慢");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"健康检查异常：{ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>单次全新连接探测当前 IP，判断是否「偏慢」（超过基准冷启动 1.8 倍或 700ms 下限）。</summary>
+        private static async Task<(bool Slow, double Ms)> ProbeCurrentOnceAsync(string ip)
+        {
+            if (!IPAddress.TryParse(ip, out var addr))
+            {
+                return (false, 0);
+            }
+
+            var state = SwitchState.Load();
+            var baseline = state.CurrentColdMs > 0 ? state.CurrentColdMs : 400;
+            var threshold = Math.Max(baseline * HealthSlowRatio, HealthSlowFloorMs);
+
+            var httpPing = new Httping();
+            var samples = await httpPing.ColdProbeAsync(addr, 1, TimeSpan.Zero);
+            if (samples.Count == 0)
+            {
+                return (true, 0);
+            }
+
+            var ms = samples[0];
+            return (ms > threshold, ms);
+        }
+
+        /// <summary>
+        /// 快速切换：从种子库挑评分最好的几个，各测 1 次全新连接，选最快的换上。
+        /// 不做全量优选，几秒内完成；评分先记 0，下一轮全量优选会重测补上真实评分。
+        /// </summary>
+        private static async Task QuickSwitchAsync(string reason)
+        {
+            if (!await SwitchLock.WaitAsync(TimeSpan.FromMinutes(2)))
+            {
+                Console.WriteLine("快速切换：主流程正在改 DNS，跳过本次，等下一轮全量优选");
+                return;
+            }
+
+            try
+            {
+                var state = SwitchState.Load();
+                var currentIp = state.CurrentIp;
+
+                var seedPool = new SeedPool();
+                seedPool.Load();
+                var candidates = seedPool.GetIPs()
+                    .Where(ip => !string.Equals(ip.ToString(), currentIp, StringComparison.OrdinalIgnoreCase))
+                    .Take(5)
+                    .ToList();
+
+                if (candidates.Count == 0)
+                {
+                    Console.WriteLine("快速切换：种子库没有其他可用 IP，等下一轮全量优选");
+                    return;
+                }
+
+                var httpPing = new Httping();
+                var measured = new List<(IPAddress Ip, double Ms)>();
+                foreach (var ip in candidates)
+                {
+                    var samples = await httpPing.ColdProbeAsync(ip, 1, TimeSpan.Zero);
+                    if (samples.Count > 0)
+                    {
+                        measured.Add((ip, samples[0]));
+                    }
+                }
+
+                if (measured.Count == 0)
+                {
+                    Console.WriteLine("快速切换：种子库 IP 全部不可用，等下一轮全量优选");
+                    return;
+                }
+
+                measured.Sort((a, b) => a.Ms.CompareTo(b.Ms));
+                var best = measured[0];
+                Console.WriteLine($"快速切换选择：{best.Ip}（首字节 {best.Ms:0}ms，候选 {measured.Count} 个）");
+
+                var dnsUpdateProviders = await GetDnsUpdateProviders();
+                var updated = false;
+                foreach (var provider in dnsUpdateProviders)
+                {
+                    foreach (var domain in provider.GetDomains(0))
+                    {
+                        try
+                        {
+                            var ok = AppConfig.DryRun
+                                ? LogDryRunUpdate(provider.ProviderName, domain, best.Ip.ToString())
+                                : await provider.Manager.AddOrUpdateARecord(domain, best.Ip.ToString());
+                            if (ok)
+                            {
+                                updated = true;
+                                if (!AppConfig.DryRun)
+                                {
+                                    Console.WriteLine($"快速切换[{provider.ProviderName}] {domain} → {best.Ip}");
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"快速切换更新失败 {domain}：{ex.Message}");
+                        }
+                    }
+                }
+
+                if (!updated)
+                {
+                    Console.WriteLine("快速切换：DNS 更新失败，等下一轮全量优选");
+                    return;
+                }
+
+                state.MarkSwitched(best.Ip.ToString(), 0, best.Ms, best.Ms);
+                state.Save();
+                Console.WriteLine($"快速切换完成（原因：{reason}）：{currentIp} → {best.Ip}");
+            }
+            finally
+            {
+                SwitchLock.Release();
+            }
         }
 
         /// <summary>
@@ -1153,53 +1358,61 @@ namespace CloudflareFastCDN
                 return SelectionResult.Empty;
             }
 
-            // 10. 更新 DNS
+            // 10. 更新 DNS（与后台健康监测互斥，避免两边同时改 DNS）
             var assignedIpsByRank = new Dictionary<int, AssignedIp>();
-            foreach (var provider in dnsUpdateProviders)
+            await SwitchLock.WaitAsync();
+            try
             {
-                foreach (var domain in provider.GetDomains(0))
+                foreach (var provider in dnsUpdateProviders)
                 {
-                    var updated = false;
-                    try
+                    foreach (var domain in provider.GetDomains(0))
                     {
-                        if (AppConfig.DryRun)
+                        var updated = false;
+                        try
                         {
-                            updated = LogDryRunUpdate(provider.ProviderName, domain, top.Ip.ToString());
-                        }
-                        else
-                        {
-                            Console.WriteLine($"开始更新[{provider.ProviderName}]域名 {domain} → {top.Ip}");
-                            updated = await provider.Manager.AddOrUpdateARecord(domain, top.Ip.ToString());
-                        }
-
-                        if (updated)
-                        {
-                            assignedIpsByRank.TryAdd(0, new AssignedIp(top.Ip, top.Delay, 1, top.Score, top.ColdMs));
-                            if (!AppConfig.DryRun)
+                            if (AppConfig.DryRun)
                             {
-                                Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
+                                updated = LogDryRunUpdate(provider.ProviderName, domain, top.Ip.ToString());
+                            }
+                            else
+                            {
+                                Console.WriteLine($"开始更新[{provider.ProviderName}]域名 {domain} → {top.Ip}");
+                                updated = await provider.Manager.AddOrUpdateARecord(domain, top.Ip.ToString());
+                            }
+
+                            if (updated)
+                            {
+                                assignedIpsByRank.TryAdd(0, new AssignedIp(top.Ip, top.Delay, 1, top.Score, top.ColdMs));
+                                if (!AppConfig.DryRun)
+                                {
+                                    Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
+                                }
                             }
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine(ex.ToString());
-                    }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine(ex.ToString());
+                        }
 
-                    DashboardState.UpdateRun(run => run.DnsUpdates.Add(new DnsUpdateResult
-                    {
-                        Provider = provider.ProviderName,
-                        Domain = domain,
-                        Rank = 1,
-                        Ip = top.Ip.ToString(),
-                        Success = updated
-                    }));
+                        DashboardState.UpdateRun(run => run.DnsUpdates.Add(new DnsUpdateResult
+                        {
+                            Provider = provider.ProviderName,
+                            Domain = domain,
+                            Rank = 1,
+                            Ip = top.Ip.ToString(),
+                            Success = updated
+                        }));
+                    }
+                }
+
+                if (assignedIpsByRank.Count > 0)
+                {
+                    switchState.MarkSwitched(top.Ip.ToString(), top.Score, top.Delay.TotalMilliseconds, top.ColdMs);
                 }
             }
-
-            if (assignedIpsByRank.Count > 0)
+            finally
             {
-                switchState.MarkSwitched(top.Ip.ToString(), top.Score, top.Delay.TotalMilliseconds, top.ColdMs);
+                SwitchLock.Release();
             }
 
             var assignedIps = assignedIpsByRank
