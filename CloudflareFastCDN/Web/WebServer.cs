@@ -76,6 +76,7 @@ namespace CloudflareFastCDN.Web
             app.MapGet("/", () => Results.Bytes(indexHtml, "text/html; charset=utf-8"));
             app.MapGet("/api/status", () => Results.Bytes(DashboardState.GetStatusJson(), "application/json"));
             app.MapGet("/api/history", () => Results.Bytes(DashboardState.GetHistoryJson(), "application/json"));
+            app.MapGet("/api/dns-propagation", () => Results.Bytes(DnsPropagationMonitor.GetResponseJson(), "application/json"));
             app.MapGet("/api/logs", (HttpContext context) =>
             {
                 long.TryParse(context.Request.Query["after"], out var after);

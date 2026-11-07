@@ -102,6 +102,14 @@ namespace CloudflareFastCDN
 
         static async Task MainAsync(string[] args)
         {
+            // 传播监控自检：对当前已生效 IP 走一遍完整链路，打印统计后退出
+            if (args.Any(a => string.Equals(a, "--selftest-propagation", StringComparison.OrdinalIgnoreCase)))
+            {
+                var probeDomain = Environment.GetEnvironmentVariable("DNS_PROPAGATION_SELFTEST_DOMAIN") ?? "loot.jxpvx.top";
+                Console.WriteLine(await DnsPropagationMonitor.SelfTestAsync(probeDomain));
+                return;
+            }
+
             bool isDocker = File.Exists("/.dockerenv");
             TimestampedConsole.Configure(isDocker);
             SettingsManager.Initialize(args, isDocker);
@@ -262,7 +270,7 @@ namespace CloudflareFastCDN
                 providers.Add(new DnsUpdateProvider(
                     "TencentCloud",
                     "TENCENTCLOUD",
-                    new TencentCloudDnsManager(AppConfig.TencentCloudSecretId, AppConfig.TencentCloudSecretKey),
+                    new TencentCloudDnsManager(AppConfig.TencentCloudSecretId, AppConfig.TencentCloudSecretKey, AppConfig.TencentCloudLine),
                     AppConfig.TencentCloudDomains,
                     AppConfig.TencentCloudDomains2,
                     AppConfig.TencentCloudDomains3));
@@ -280,7 +288,7 @@ namespace CloudflareFastCDN
                 providers.Add(new DnsUpdateProvider(
                     "AlibabaCloud",
                     "ALIBABACLOUD",
-                    new AlibabaCloudDnsManager(AppConfig.AlibabaCloudAccessKeyId, AppConfig.AlibabaCloudAccessKeySecret),
+                    new AlibabaCloudDnsManager(AppConfig.AlibabaCloudAccessKeyId, AppConfig.AlibabaCloudAccessKeySecret, AppConfig.AlibabaCloudLine),
                     AppConfig.AlibabaCloudDomains,
                     AppConfig.AlibabaCloudDomains2,
                     AppConfig.AlibabaCloudDomains3));
@@ -812,6 +820,7 @@ namespace CloudflareFastCDN
                                 if (!AppConfig.DryRun)
                                 {
                                     Console.WriteLine($"快速切换[{provider.ProviderName}] {domain} → {best.Ip}");
+                                    DnsPropagationMonitor.NotifyUpdated(provider.ProviderName, domain, best.Ip.ToString());
                                 }
                             }
                         }
@@ -883,6 +892,7 @@ namespace CloudflareFastCDN
                             if (!AppConfig.DryRun)
                             {
                                 Console.WriteLine($"灾备更新[{provider.ProviderName}] {domain} → {best.IP}");
+                                DnsPropagationMonitor.NotifyUpdated(provider.ProviderName, domain, best.IP.ToString());
                             }
                         }
                     }
@@ -1227,7 +1237,7 @@ namespace CloudflareFastCDN
                         passed = false;
                         failReason = $"冷启动有效样本不足（{coldSamples.Count}/{ColdProbeCount}）";
                     }
-                    else if (coldMedian > ColdMedianThresholdMs || coldCv > ColdCvThreshold)
+                    else if (coldMedian > AppConfig.ColdMedianThresholdMs || coldCv > ColdCvThreshold)
                     {
                         passed = false;
                         failReason = $"冷启动不稳（中位 {coldMedian:0}ms，cv {coldCv:0.00}）";
@@ -1386,6 +1396,7 @@ namespace CloudflareFastCDN
                                 if (!AppConfig.DryRun)
                                 {
                                     Console.WriteLine($"已完成更新[{provider.ProviderName}]域名 {domain}");
+                                    DnsPropagationMonitor.NotifyUpdated(provider.ProviderName, domain, top.Ip.ToString());
                                 }
                             }
                         }
