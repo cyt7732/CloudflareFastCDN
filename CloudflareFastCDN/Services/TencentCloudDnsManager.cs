@@ -20,11 +20,13 @@ namespace CloudflareFastCDN.Services
         private readonly string _secretId;
         private readonly string _secretKey;
         private IReadOnlyList<string>? _cachedDomains;
+        private readonly string _line;
 
-        public TencentCloudDnsManager(string secretId, string secretKey)
+        public TencentCloudDnsManager(string secretId, string secretKey, string line = "默认")
         {
             _secretId = secretId;
             _secretKey = secretKey;
+            _line = string.IsNullOrWhiteSpace(line) ? DefaultRecordLine : line.Trim();
             _httpClient = new HttpClient
             {
                 BaseAddress = new Uri(Endpoint)
@@ -44,7 +46,7 @@ namespace CloudflareFastCDN.Services
 
             var existingRecords = await GetDnsRecordsAsync(resolvedDomain.Value.RootDomain, resolvedDomain.Value.RecordName);
             var defaultLineRecords = existingRecords
-                .Where(record => string.Equals(record.Line, DefaultRecordLine, StringComparison.OrdinalIgnoreCase))
+                .Where(record => string.Equals(record.Line, _line, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
             if (defaultLineRecords.Count > 0 &&
@@ -64,7 +66,7 @@ namespace CloudflareFastCDN.Services
                         RecordId = record.RecordId,
                         SubDomain = resolvedDomain.Value.RecordName,
                         RecordType = "A",
-                        RecordLine = DefaultRecordLine,
+                        RecordLine = _line,
                         Value = ipAddress,
                         TTL = DefaultTtl
                     });
@@ -77,7 +79,7 @@ namespace CloudflareFastCDN.Services
                     Domain = resolvedDomain.Value.RootDomain,
                     SubDomain = resolvedDomain.Value.RecordName,
                     RecordType = "A",
-                    RecordLine = DefaultRecordLine,
+                    RecordLine = _line,
                     Value = ipAddress,
                     TTL = DefaultTtl
                 });

@@ -7,6 +7,8 @@ namespace CloudflareFastCDN.Utils
         public static string TencentCloudSecretKey { get; set; } = string.Empty;
         public static string AlibabaCloudAccessKeyId { get; set; } = string.Empty;
         public static string AlibabaCloudAccessKeySecret { get; set; } = string.Empty;
+        public static string AlibabaCloudLine { get; set; } = "default";
+        public static string TencentCloudLine { get; set; } = "默认";
 
         public static string[] CloudflareDomains { get; set; } = Array.Empty<string>();
         public static string[] CloudflareDomains2 { get; set; } = Array.Empty<string>();
@@ -20,6 +22,7 @@ namespace CloudflareFastCDN.Utils
 
         public static int PingThreads { get; set; } = 8;
         public static int MaxIps { get; set; } = 400;
+        public static double ColdMedianThresholdMs { get; set; } = 700;
         public static int PingIntervalMs { get; set; } = 150;
         public static string HttpProbeUrl { get; set; } = "https://www.visa.cn/";
         public static IReadOnlyDictionary<string, string> HttpProbeHeaders { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);

@@ -313,6 +313,10 @@ namespace CloudflareFastCDN.Settings
             AppConfig.TencentCloudSecretKey = Value("TENCENTCLOUD_SECRET_KEY");
             AppConfig.AlibabaCloudAccessKeyId = Value("ALIBABACLOUD_ACCESS_KEY_ID");
             AppConfig.AlibabaCloudAccessKeySecret = Value("ALIBABACLOUD_ACCESS_KEY_SECRET");
+            var alibabaLine = Value("ALIBABACLOUD_LINE");
+            AppConfig.AlibabaCloudLine = string.IsNullOrWhiteSpace(alibabaLine) ? "default" : alibabaLine.Trim();
+            var tencentLine = Value("TENCENTCLOUD_LINE");
+            AppConfig.TencentCloudLine = string.IsNullOrWhiteSpace(tencentLine) ? "默认" : tencentLine.Trim();
 
             AppConfig.CloudflareDomains = ParseDomainList(Value("CLOUDFLARE_DOMAINS"));
             AppConfig.CloudflareDomains2 = ParseDomainList(Value("CLOUDFLARE_DOMAINS2"));
@@ -326,6 +330,7 @@ namespace CloudflareFastCDN.Settings
 
             AppConfig.PingThreads = ParseNonZeroIntWithDefault(Value("PING_THREADS"), 8);
             AppConfig.MaxIps = ParseNonZeroIntWithDefault(Value("MAX_IPS"), 400);
+            AppConfig.ColdMedianThresholdMs = ParsePositiveIntWithDefault(Value("COLD_MEDIAN_THRESHOLD_MS"), 700);
             AppConfig.PingIntervalMs = ParseNonZeroIntWithDefault(Value("PING_INTERVAL_MS"), 150);
             var httpProbeUrl = Value("HTTP_PROBE_URL");
             AppConfig.HttpProbeUrl = string.IsNullOrWhiteSpace(httpProbeUrl) ? "https://www.visa.cn/" : httpProbeUrl;

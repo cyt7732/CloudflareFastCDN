@@ -17,11 +17,13 @@ namespace CloudflareFastCDN.Services
         private readonly string _accessKeyId;
         private readonly string _accessKeySecret;
         private IReadOnlyList<string>? _cachedDomains;
+        private readonly string _line;
 
-        public AlibabaCloudDnsManager(string accessKeyId, string accessKeySecret)
+        public AlibabaCloudDnsManager(string accessKeyId, string accessKeySecret, string line = "default")
         {
             _accessKeyId = accessKeyId;
             _accessKeySecret = accessKeySecret;
+            _line = string.IsNullOrWhiteSpace(line) ? DefaultLine : line.Trim();
             _httpClient = new HttpClient
             {
                 BaseAddress = new Uri(Endpoint)
@@ -41,7 +43,7 @@ namespace CloudflareFastCDN.Services
 
             var existingRecords = await GetDnsRecordsAsync(resolvedDomain.Value.RootDomain, resolvedDomain.Value.RecordName);
             var defaultLineRecords = existingRecords
-                .Where(record => string.Equals(record.Line, DefaultLine, StringComparison.OrdinalIgnoreCase))
+                .Where(record => string.Equals(record.Line, _line, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
             if (defaultLineRecords.Count > 0 &&
@@ -61,7 +63,7 @@ namespace CloudflareFastCDN.Services
                         ["RR"] = resolvedDomain.Value.RecordName,
                         ["Type"] = "A",
                         ["Value"] = ipAddress,
-                        ["Line"] = DefaultLine,
+                        ["Line"] = _line,
                         ["TTL"] = DefaultTtl.ToString(CultureInfo.InvariantCulture)
                     });
                 }
@@ -74,7 +76,7 @@ namespace CloudflareFastCDN.Services
                     ["RR"] = resolvedDomain.Value.RecordName,
                     ["Type"] = "A",
                     ["Value"] = ipAddress,
-                    ["Line"] = DefaultLine,
+                    ["Line"] = _line,
                     ["TTL"] = DefaultTtl.ToString(CultureInfo.InvariantCulture)
                 });
             }

@@ -43,12 +43,14 @@ namespace CloudflareFastCDN.Settings
 
             new("TENCENTCLOUD_SECRET_ID", GroupTencentCloud, "SecretId", SettingType.Secret, "", "腾讯云 API 密钥 SecretId", AffectsDns: true),
             new("TENCENTCLOUD_SECRET_KEY", GroupTencentCloud, "SecretKey", SettingType.Secret, "", "腾讯云 API 密钥 SecretKey", AffectsDns: true),
+            new("TENCENTCLOUD_LINE", GroupTencentCloud, "解析线路", SettingType.Text, "默认", "DNSPod 解析线路：默认 / 电信 / 联通 / 移动 / 教育网 / 境外 等；多实例分运营商时各自填对应线路", AffectsDns: true),
             new("TENCENTCLOUD_DOMAINS", GroupTencentCloud, "第 1 名 IP 的域名", SettingType.DomainList, "", "使用优选第 1 名 IP 更新的域名", AffectsDns: true),
             new("TENCENTCLOUD_DOMAINS2", GroupTencentCloud, "第 2 名 IP 的域名", SettingType.DomainList, "", "使用优选第 2 名 IP 更新的域名", AffectsDns: true),
             new("TENCENTCLOUD_DOMAINS3", GroupTencentCloud, "第 3 名 IP 的域名", SettingType.DomainList, "", "使用优选第 3 名 IP 更新的域名", AffectsDns: true),
 
             new("ALIBABACLOUD_ACCESS_KEY_ID", GroupAlibabaCloud, "AccessKey ID", SettingType.Secret, "", "阿里云 API AccessKey ID", AffectsDns: true),
             new("ALIBABACLOUD_ACCESS_KEY_SECRET", GroupAlibabaCloud, "AccessKey Secret", SettingType.Secret, "", "阿里云 API AccessKey Secret", AffectsDns: true),
+            new("ALIBABACLOUD_LINE", GroupAlibabaCloud, "解析线路", SettingType.Text, "default", "阿里云解析线路：default=默认 / telecom=电信 / unicom=联通 / mobile=移动 / overseas=境外 等；多实例分运营商时各自填对应线路", AffectsDns: true),
             new("ALIBABACLOUD_DOMAINS", GroupAlibabaCloud, "第 1 名 IP 的域名", SettingType.DomainList, "", "使用优选第 1 名 IP 更新的域名", AffectsDns: true),
             new("ALIBABACLOUD_DOMAINS2", GroupAlibabaCloud, "第 2 名 IP 的域名", SettingType.DomainList, "", "使用优选第 2 名 IP 更新的域名", AffectsDns: true),
             new("ALIBABACLOUD_DOMAINS3", GroupAlibabaCloud, "第 3 名 IP 的域名", SettingType.DomainList, "", "使用优选第 3 名 IP 更新的域名", AffectsDns: true),
@@ -58,6 +60,7 @@ namespace CloudflareFastCDN.Settings
             new("PING_INTERVAL_MS", GroupSelection, "Ping 间隔（毫秒）", SettingType.Integer, "150", "同一 IP 两次 Ping 之间的间隔", Min: 1, Max: 10000),
             new("BANDWIDTH_PRIORITY", GroupSelection, "带宽优先", SettingType.Boolean, "false", "开启后下载 /speedtest 测速并按带宽排序，测速失败自动回退为延迟优先"),
             new("UPDATE_IP_LIST", GroupSelection, "启动时更新 IP 段", SettingType.Boolean, "false", "启动时从 Cloudflare 官方更新 IPv4 网段列表", RestartRequired: true),
+            new("COLD_MEDIAN_THRESHOLD_MS", GroupSelection, "冷启动中位门槛(ms)", SettingType.Integer, "700", "冷启动探测中位延时超过此值判不通过；链路偏慢的线路(如部分联通/企业网)可调高，默认700", Min: 100, Max: 20000),
 
             new("HTTP_PROBE_URL", GroupHttp, "HTTP 验证地址", SettingType.Url, "https://www.visa.cn/", "建议使用已开启 Cloudflare 代理（黄云）的自有站点"),
             new("HTTP_PROBE_HEADERS", GroupHttp, "附加请求头", SettingType.Headers, "", "HTTP 验证和测速请求附加的请求头，每行一个，格式为 Header-Name: Value"),
